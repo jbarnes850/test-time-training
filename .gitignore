@@ -1,0 +1,27 @@
+# Environment
+.env
+.env.*
+.venv/
+venv/
+.uv/
+
+# Python
+__pycache__/
+*.pyc
+.pytest_cache/
+ruff_cache/
+.cache/
+
+# OS
+.DS_Store
+
+# Runs (large, generated)
+runs/
+
+# Vendor submodules (not tracked in main repo)
+vendor/
+.gitmodules
+
+# IDE
+.idea/
+.vscode/

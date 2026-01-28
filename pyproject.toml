@@ -1,0 +1,31 @@
+[project]
+name = "kernelbench-rl-env"
+version = "0.1.0"
+description = "KernelBench L1 RL environment scaffold"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+dependencies = [
+  "datasets>=2.19.0",
+  "numpy>=1.24.0",
+  "openai>=2.14.0",
+  "python-dotenv>=1.0.1",
+  "litellm>=1.40.0",
+  "tinker",
+  "torch",
+  "tqdm>=4.64.0",
+  "chz",
+  "pillow",
+  "termcolor",
+  "pandas",
+  "matplotlib",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=7.4.0",
+]
+
+[tool.pytest.ini_options]
+addopts = "-q"
+testpaths = ["tests"]

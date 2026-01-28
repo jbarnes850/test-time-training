@@ -1,0 +1,22 @@
+{
+  "dataset": {
+    "name": "ScalingIntelligence/KernelBench",
+    "config_name": "default",
+    "version": "0.0.0",
+    "fingerprint": "66eecc5652b90a3e",
+    "num_rows": 100
+  },
+  "split": {
+    "path": "/Users/jarrodbarnes/kernelbench-rl-env/splits/l1_seed42.json",
+    "hash_expected": "e1669a9da6a2ca82d6f7cedec5d77bc0db4b2059accc51adc7a18d681e07a4fb",
+    "hash_computed": "e1669a9da6a2ca82d6f7cedec5d77bc0db4b2059accc51adc7a18d681e07a4fb",
+    "seed": 42
+  },
+  "code": {
+    "git_commit": "unknown"
+  },
+  "checks": {
+    "dataset_metadata_match": true
+  },
+  "manifest_hash": "f279642586d32ff287b4f52f3ce475c3fa2f1ccbeca596a55b8c781151ac20cd"
+}
