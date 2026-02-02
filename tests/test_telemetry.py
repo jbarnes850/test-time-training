@@ -23,6 +23,8 @@ def test_validate_telemetry():
         backend="cuda",
         precision="fp32",
         eval_metadata={"note": "ok"},
+        error_message="",
+        error_trace="",
     )
     data = record.to_dict()
     validate_telemetry(data)
@@ -48,6 +50,8 @@ def test_validate_telemetry_missing_field():
         backend="cuda",
         precision="fp32",
         eval_metadata={},
+        error_message="",
+        error_trace="",
     ).to_dict()
     record.pop("model_id")
     with pytest.raises(ValueError):

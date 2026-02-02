@@ -5,6 +5,7 @@ from pathlib import Path
 import hashlib
 
 from src.env.schema import EvalResult
+from src.utils.feedback_utils import extract_error_info
 from src.utils.path_utils import repo_root
 from src.utils.dataset_utils import load_kernelbench_level
 
@@ -66,13 +67,17 @@ def eval_config_from_env() -> EvalConfig:
 
 
 def _error_result(message: str) -> EvalResult:
+    metadata = {"error": message}
+    error_message, error_trace = extract_error_info(metadata)
+    metadata["error_message"] = error_message
+    metadata["error_trace"] = error_trace
     return EvalResult(
         compiled=False,
         correctness=False,
         runtime_us=-1.0,
         ref_runtime_us=-1.0,
         speedup=0.0,
-        metadata={"error": message},
+        metadata=metadata,
     )
 
 
@@ -111,13 +116,22 @@ def evaluate_kernel(problem_id: int, kernel_code: str, level: int = 1, config: E
         ref_runtime_us = float(eval_result.ref_runtime)
         speedup = compute_speedup(runtime_us, ref_runtime_us)
 
+        metadata = dict(eval_result.metadata or {})
+        if hasattr(kernel_eval, "check_metadata_serializable_all_types"):
+            metadata = kernel_eval.check_metadata_serializable_all_types(metadata)
+        error_message, error_trace = extract_error_info(metadata)
+        if error_message:
+            metadata["error_message"] = error_message
+        if error_trace:
+            metadata["error_trace"] = error_trace
+
         return EvalResult(
             compiled=bool(eval_result.compiled),
             correctness=bool(eval_result.correctness),
             runtime_us=runtime_us,
             ref_runtime_us=ref_runtime_us,
             speedup=speedup,
-            metadata=dict(eval_result.metadata or {}),
+            metadata=metadata,
         )
     except Exception as exc:
         return _error_result(str(exc))

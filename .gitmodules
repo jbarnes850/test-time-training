@@ -1,0 +1,6 @@
+[submodule "vendor/KernelBench"]
+	path = vendor/KernelBench
+	url = https://github.com/ScalingIntelligence/KernelBench.git
+[submodule "vendor/tinker-cookbook"]
+	path = vendor/tinker-cookbook
+	url = https://github.com/thinking-machines-lab/tinker-cookbook.git

@@ -15,6 +15,7 @@ from src.env.evaluator import evaluate_kernel, compute_reward
 from src.env.tasking import load_task, build_messages
 from src.utils.tinker_utils import ensure_tinker_cookbook_on_path
 from src.utils.code_utils import extract_python_code, assemble_modelnew_code
+from src.utils.feedback_utils import extract_error_info
 
 ensure_tinker_cookbook_on_path()
 
@@ -124,6 +125,7 @@ class KernelEnv(Env):
                 "assembled_code": kernel_code,
             }
             # Stream telemetry for parse errors too
+            error_message, error_trace = extract_error_info(eval_result.metadata)
             _write_telemetry({
                 "problem_id": self.problem_id,
                 "level": self.level,
@@ -136,6 +138,8 @@ class KernelEnv(Env):
                 "runtime_us": -1.0,
                 "ref_runtime_us": -1.0,
                 "parse_error": str(exc),
+                "error_message": error_message,
+                "error_trace": error_trace,
             })
             next_ob, next_stop = await self.initial_observation()
             return StepResult(
@@ -171,6 +175,7 @@ class KernelEnv(Env):
         }
 
         # Stream telemetry for real-time visibility
+        error_message, error_trace = extract_error_info(eval_result.metadata)
         _write_telemetry({
             "problem_id": self.problem_id,
             "level": self.level,
@@ -182,6 +187,8 @@ class KernelEnv(Env):
             "baseline_median": baseline_median,
             "runtime_us": eval_result.runtime_us,
             "ref_runtime_us": eval_result.ref_runtime_us,
+            "error_message": error_message,
+            "error_trace": error_trace,
         })
 
         # Single-step episode; return same observation as final state

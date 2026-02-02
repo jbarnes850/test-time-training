@@ -24,6 +24,8 @@ REQUIRED_FIELDS = {
     "backend": str,
     "precision": str,
     "eval_metadata": dict,
+    "error_message": str,
+    "error_trace": str,
     "timestamp": float,
 }
 
@@ -47,6 +49,8 @@ class TelemetryRecord:
     backend: str
     precision: str
     eval_metadata: Dict[str, Any]
+    error_message: str
+    error_trace: str
     timestamp: float
 
     def to_dict(self) -> Dict[str, Any]:
@@ -96,6 +100,8 @@ def build_record(
     backend: str,
     precision: str,
     eval_metadata: Optional[Dict[str, Any]] = None,
+    error_message: str = "",
+    error_trace: str = "",
 ) -> TelemetryRecord:
     return TelemetryRecord(
         run_id=run_id,
@@ -115,6 +121,8 @@ def build_record(
         backend=backend,
         precision=precision,
         eval_metadata=eval_metadata or {},
+        error_message=error_message,
+        error_trace=error_trace,
         timestamp=time.time(),
     )
 
