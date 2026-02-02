@@ -31,6 +31,7 @@ scripts/run_hparam_matrix.sh
 scripts/run_sweep.sh
 scripts/upload_hf.py
 scripts/make_plots.py
-model_cards/kernel_ttt.md
+AGENTS.md
+model_cards/
 artifacts/manifest.json
 *.log

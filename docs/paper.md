@@ -8,11 +8,13 @@
 
 Test-time training (TTT) has emerged as a powerful paradigm for adapting language models to specific problem instances, with recent work reporting extended adaptation over dozens of gradient steps. But how much adaptation is actually needed? We study this question in verifiable execution-grounded (VEG) tasks—domains like GPU kernel optimization where a deterministic evaluator provides dense, continuous reward signals.
 
-Using KernelBench as our testbed, we find that **1-2 gradient steps suffice**: performance peaks early and then regresses as the policy over-sharpens. This establishes a *minimum signal threshold* for dense-reward domains—the point at which gradient signal saturates and further adaptation degrades diversity. We formalize checkpoint selection over this trajectory as Best-of-Adaptation (BoA), a practical algorithm that matched oracle selection in our experiments.
+Using KernelBench as our testbed, we find that **1-2 gradient steps suffice**: performance peaks early and then regresses as the policy over-sharpens. This establishes a *minimum signal threshold* for dense-reward domains—the point at which gradient signal saturates and further adaptation degrades diversity. We formalize checkpoint selection over this trajectory as Best-of-Adaptation (BoA), a practical algorithm that matched oracle selection on our primary task subset.
 
-A second finding challenges the value of feedback engineering: rich execution feedback provides no lift over prompt-only self-distillation (+4.2% advantage for prompt-only across 3 seeds). When the world already provides continuous rewards, an AI teacher interpreting that signal becomes redundant.
+A second finding challenges the value of feedback engineering: rich execution feedback provides no lift over prompt-only self-distillation (+4.2% advantage for prompt-only across 3 seeds). When the world already provides dense continuous rewards, an AI teacher interpreting that signal may become redundant.
 
 These results characterize an efficiency frontier for TTT in dense-reward settings. The hours-not-days efficiency we demonstrate is a practical prerequisite for future physics-grounded world models—systems that internalize hardware behavior to generate optimized code without physical execution.
+
+**Keywords:** test-time training, reinforcement learning, GPU kernel optimization, KernelBench, checkpoint selection, self-distillation, verifiable execution
 
 ---
 
@@ -22,7 +24,7 @@ This paper studies test-time training (TTT) for verifiable execution-grounded (V
 
 TTT-Discover (Yuksekgonul et al., 2026) established that test-time RL can achieve substantial gains on discovery tasks through extended adaptation with large rollout budgets, reporting costs of "a few hundred dollars per problem." This raises a fundamental question about resource allocation: how much test-time gradient signal is actually needed? We hypothesize that in VEG domains with dense scalar rewards, the gradient signal saturates much faster than in sparse-reward settings—and that the elaborate feedback mechanisms designed for sparse domains become redundant when the world already provides dense continuous feedback.
 
-We test this hypothesis using GPU kernel optimization as the experimental domain. Our dual-loop architecture combines train-time GRPO on 80 KernelBench L1 tasks with test-time LoRA adaptation under the deterministic evaluator. This enables controlled comparison between gradient-based adaptation and brute-force sampling (Best-of-N) under matched compute budgets.
+We test this hypothesis using GPU kernel optimization as the experimental domain. Our dual-loop architecture combines train-time Group Relative Policy Optimization (GRPO) on 80 KernelBench Level 1 (L1) tasks with test-time Low-Rank Adaptation (LoRA) under the deterministic evaluator. This enables controlled comparison between gradient-based adaptation and brute-force sampling (Best-of-N) under matched compute budgets.
 
 Three contributions emerge from experiments on 10 KernelBench L1 tasks across 3 seeds. First, we characterize the efficiency frontier: performance peaks after 1-2 adaptation steps then regresses, indicating that checkpoint selection rather than extended training drives the benefit. We formalize this as Best-of-Adaptation (BoA), a practical algorithm using early stopping that matched oracle selection in our experiments. Second, we identify a minimum signal threshold for VEG tasks—the amount of gradient signal needed before over-sharpening degrades diversity—showing it is 1-2 steps from 160 diverse samples, remarkably low compared to TTT-Discover's 50-step paradigm. Third, we provide evidence for the reward density hypothesis: rich tokenized execution feedback provides no lift over prompt-only self-distillation across all 3 seeds (+4.2% advantage for prompt-only), suggesting that feedback engineering value is inversely proportional to reward density. When the world provides dense continuous rewards, an AI teacher interpreting that signal becomes redundant.
 
@@ -38,7 +40,7 @@ These results characterize the efficiency frontier of TTT for kernel optimizatio
 
 **Verifiable Execution-Grounded Tasks.** We focus on VEG tasks—domains where a deterministic evaluator provides ground-truth feedback without human judgment. GPU kernel optimization is the primary example: KernelBench (Ouyang et al., 2025) evaluates 250 workloads on correctness and speedup, with speedup ranging continuously from 0x to 10x+. Related VEG domains include assembly superoptimization (SuperCoder, 2025), formal theorem proving, and simulator-based scientific discovery. "Towards Execution-Grounded Automated AI Research" (Jan 2026) argues that execution grounding is essential to escape "plausible-looking but ineffective" solutions and notes that RL from execution rewards can collapse to narrow ideas—a dynamic our BoA checkpoint selection is designed to address.
 
-**Kernel Optimization: Prior Approaches.** Prior work on LLM-based kernel optimization has not characterized the efficiency frontier of test-time adaptation. Kevin (Baronio et al., 2025) achieves 82% correctness through multi-turn train-time RL but keeps weights frozen at inference. CUDA-L2 (2025) surpasses cuBLAS by 19.2% through two-stage GRPO. Magellan (Jan 2026) requires ~1.5 days of evolutionary search to produce deployable compiler heuristics—we achieve comparable efficiency gains in hours through minimal adaptation. AccelOpt (2025) uses "Optimization Memory" for kernel search without weight adaptation. Our contribution is showing that test-time weight adaptation can be highly efficient: 1-2 steps from diverse samples suffices before over-sharpening degrades performance.
+**Kernel Optimization: Prior Approaches.** Prior work on LLM-based kernel optimization has not characterized the efficiency frontier of test-time adaptation. Kevin (Baronio et al., 2025) achieves 82% correctness through multi-turn train-time RL but keeps weights frozen at inference. CUDA-L2 (2025) surpasses cuBLAS by 19.2% through two-stage GRPO. Magellan (Jan 2026) requires ~1.5 days of evolutionary search to produce deployable compiler heuristics—we achieve comparable efficiency gains in hours through minimal adaptation. AccelOpt (2025) uses "Optimization Memory" for kernel search without weight adaptation. Our contribution is showing that test-time weight adaptation can be highly efficient: 1-2 steps from diverse samples suffice before over-sharpening degrades performance.
 
 **Feedback Engineering: When Does It Help?** We find that rich execution feedback provides no lift over prompt-only self-distillation in our dense-reward setting (+4.2% advantage for prompt-only). This contradicts SDPO (Zeng et al., 2026), which reports 3x sample efficiency from token-level distillation conditioned on feedback. The reconciliation is reward density: SDPO evaluates on sparse-reward domains (scientific reasoning, competitive programming) where feedback interpretation adds signal. In dense-reward VEG tasks where the world provides continuous scalars, that interpretation becomes redundant. We term this the *reward density hypothesis*: feedback value is inversely proportional to reward density.
 
@@ -223,7 +225,7 @@ This pattern reveals the mechanism: **early gradient steps aggregate signal from
 
 *Figure 2: Adaptation trajectory across 3 seeds showing performance peaks at 1-2 steps then regresses. The shaded "Minimum Signal Threshold" region highlights where gradient signal saturates. Stars mark BoA-selected checkpoints. Compare to TTT-Discover's ~50 steps.*
 
-### 5.3 BoA Selection Analysis
+### 5.3 BoA Checkpoint Selection (Seed 42)
 
 **Seed 42 Selection Comparison:**
 
@@ -313,6 +315,8 @@ The contrasting results between subsets reveal that BoA's benefit is **regime-de
 This suggests that **adaptation amplifies existing capability rather than creating new capability**. When the base policy achieves reasonable coverage (subset 1), gradient updates can refine solutions. When the base policy struggles (subset 2), adaptation may overfit to poor solutions, reducing diversity.
 
 **Practical Implication:** Practitioners should prefer BoA when the base policy is moderately capable, but fall back to Best-of-N search in hard regimes where the model has low coverage.
+
+Figure 4 visualizes this regime dependence, showing that tasks with >30% base coverage (green) benefit from BoA while tasks below this threshold (red) favor Best-of-N search.
 
 ![Regime-Dependent Benefit](/artifacts/fig4_regime.png)
 
@@ -429,6 +433,12 @@ Three findings characterize the efficiency frontier within our experimental scop
 These findings suggest a minimum signal threshold for dense-reward VEG domains: a short gradient "hop" (1-2 steps from diverse samples) may reach solutions that extended adaptation cannot improve upon. Within our experiments, the optimal TTT compute allocation invested in sample diversity, not adaptation duration.
 
 The deeper implication concerns physics-grounded world models. Efficient TTT distills the world's response into model weights in hours rather than days. Across many adaptation cycles—Volta to Ampere to Hopper to Blackwell—models may accumulate internal representations of how code interacts with hardware. Eventually, models might generate optimal kernels for new architectures by simulating the grounding they learned, without physical execution. The efficiency frontier we characterize determines whether this zero-evaluation discovery is tractable at scale. By establishing that 1-2 steps suffice, we make the path toward physics-grounded world models computationally feasible.
+
+---
+
+## Acknowledgments
+
+We thank Thinking Machines Lab for access to the Tinker training infrastructure.
 
 ---
 
