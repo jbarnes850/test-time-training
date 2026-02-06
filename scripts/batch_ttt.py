@@ -29,6 +29,7 @@ Batch TTT (this script):
 import argparse
 import json
 import os
+import random
 import statistics
 import time
 from collections import deque
@@ -210,6 +211,7 @@ def batch_ttt_step(
     task_samples_list: List[TaskSamples],
     training_client,
     learning_rate: float,
+    shuffle_rewards: bool = False,
 ) -> None:
     """Perform a single TTRL-style gradient update across all tasks.
 
@@ -222,6 +224,9 @@ def batch_ttt_step(
     all_rewards = []
     for ts in task_samples_list:
         all_rewards.extend(ts.rewards)
+
+    if shuffle_rewards:
+        random.shuffle(all_rewards)
 
     # Compute global advantages (TTRL-style)
     all_advantages = compute_global_advantages(all_rewards)
@@ -315,6 +320,7 @@ def main() -> int:
     parser.add_argument("--num_perf_trials", type=int, default=5)
     parser.add_argument("--baseline_window", type=int, default=32, help="Window size for reward normalization")
     parser.add_argument("--correct_bonus", type=float, default=0.0, help="Bonus reward for correct samples")
+    parser.add_argument("--shuffle_rewards", action="store_true", help="Shuffle rewards across samples before GRPO (noise control)")
     args = parser.parse_args()
 
     if not os.environ.get("TINKER_API_KEY"):
@@ -440,7 +446,7 @@ def main() -> int:
         print(f"Step {step + 1}: Gradient update + re-sample...")
 
         # Gradient update using current samples
-        batch_ttt_step(task_samples_list, training_client, args.learning_rate)
+        batch_ttt_step(task_samples_list, training_client, args.learning_rate, args.shuffle_rewards)
 
         # Save new weights and create new sampling client
         sampling_path = training_client.save_weights_for_sampler(name=f"step_{step + 1}").result().path

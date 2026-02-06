@@ -1,34 +1,44 @@
-# When Does Test-Time Training Saturate?
+# Surprisal-Guided Selection
 
+[![Paper](https://img.shields.io/badge/Paper-arXiv%20Preprint-red)](docs/paper.md)
 [![Model](https://img.shields.io/badge/Model-HuggingFace-yellow)](https://huggingface.co/Jarrodbarnes/KernelBench-RLVR-120b)
-[![Paper](https://img.shields.io/badge/Paper-Technical%20Report-red)](docs/technical_report.pdf)
 [![License](https://img.shields.io/badge/License-Apache%202.0-blue)](LICENSE)
 
-> Evidence from Verifiable Execution-Grounded Tasks
+> Compute-Optimal Test-Time Strategies for Execution-Grounded Code Generation
 
-This repository contains the code for reproducing the experiments in our paper on test-time training efficiency in verifiable execution-grounded (VEG) tasks. We study GPU kernel optimization using KernelBench as our testbed.
+This repository contains the code for reproducing the experiments in our paper on compute-optimal test-time strategies for verifiable execution-grounded (VEG) tasks. We study GPU kernel optimization using KernelBench as our testbed and a 120B-parameter model (GPT-OSS-120B with LoRA adaptation).
 
-![Architecture](artifacts/fig_environment.png)
+![Environment](artifacts/fig_environment.png)
 
 ## Key Findings
 
 | Finding | Result | Evidence |
 |---------|--------|----------|
-| **Minimum signal threshold** | 1-2 gradient steps suffice | Performance peaks then regresses due to over-sharpening |
-| **Feedback redundancy** | Prompt-only beats rich feedback | +4.2% advantage across 3 seeds |
-| **Regime dependence** | BoA helps at >30% coverage | Search maintains diversity advantage in hard regimes |
+| **Search dominates adaptation** | Best-of-N K=64: 100% task success; TTT BoA: 35% | TTT equivalent K < 1, worse than random single sample |
+| **Surprisal-guided selection** | 80% success vs 50% for confidence-guided | Highest-surprisal correct samples yield best kernels at zero cost |
+| **Over-sharpening mechanism** | TTT collapses diversity toward mediocre solutions | Gradient updates concentrate probability on early successes, missing the distribution tail |
 
 ![Adaptation Trajectory](artifacts/fig2_trajectory.png)
 
 ## Results Summary
 
-**Table 5.1: Efficiency Frontier (3 seeds, KernelBench L1 eval)**
+**Selection Strategy Results (Subset 1, 2 seeds, K=64)**
 
-| Method | fast_1 | std | Correctness | Rollouts |
-|--------|--------|-----|-------------|----------|
-| **Batch-TTT BoA** | **30.6%** | 11.3% | 91.5% | 960 |
-| **SDPO Prompt-Only** | **30.4%** | 7.6% | 91.9% | 320 |
-| Best-of-N (K=64) | 30.9% | - | 87.2% | 320 |
+| Strategy | fast_1 | std | Mean Speedup |
+|----------|--------|-----|--------------|
+| best-correct (Oracle) | 100% | 0% | 226.9x |
+| **surprisal-guided-top3** | **100%** | **0%** | **139.0x** |
+| **surprisal-guided** | **80%** | **0%** | **41.2x** |
+| random-correct | 59.2% | 2.7% | 30.0x |
+| confidence-guided | 50% | 14.1% | 11.6x |
+
+**Best-of-N Scaling Curve**
+
+| Samples (K) | Task Success | Saturates? |
+|-------------|-------------|------------|
+| 1 | 53.3% | |
+| 16 | 99.9% | Practical saturation |
+| 64 | 100% | Oracle ceiling |
 
 ## Quick Start
 
@@ -60,7 +70,7 @@ export TINKER_API_KEY=your_key_here
 export HF_TOKEN=your_token_here  # Optional, for dataset access
 ```
 
-### Best-of-N Baseline (Table 5.2)
+### Best-of-N Baseline
 
 ```bash
 uv run python -m scripts.best_of_n \
@@ -70,7 +80,7 @@ uv run python -m scripts.best_of_n \
   --max_tasks 5
 ```
 
-### Batch TTT with BoA Selection (Table 5.1)
+### Batch TTT with BoA Selection
 
 ```bash
 uv run python -m scripts.batch_ttt \
@@ -80,7 +90,7 @@ uv run python -m scripts.batch_ttt \
   --steps 5
 ```
 
-### SDPO Self-Distillation (Table 5.1)
+### SDPO Self-Distillation
 
 ```bash
 # Prompt-only (recommended)
@@ -114,13 +124,12 @@ kernelbench-rl-env/
 │   ├── train_smoke.py      # RLVR training
 │   └── make_split.py       # Create train/eval splits
 ├── splits/                 # Deterministic data splits
-├── artifacts/              # Paper figures
-├── docs/                   # Documentation
-│   └── technical_report.pdf # Full paper
+├── artifacts/              # Paper figures and generation scripts
+├── docs/                   # Paper source (paper.md) and runbook
 ├── tests/                  # Test suite
 └── vendor/                 # Submodules
     ├── KernelBench/        # Evaluation framework
-    └── tinker-cookbook/    # Training library
+    └── tinker-cookbook/     # Training library
 ```
 
 ## Environment Variables
@@ -154,8 +163,8 @@ tokenizer = AutoTokenizer.from_pretrained("Jarrodbarnes/KernelBench-RLVR-120b")
 ## Citation
 
 ```bibtex
-@article{barnes2026ttt,
-  title={When Does Test-Time Training Saturate? Evidence from Verifiable Execution-Grounded Tasks},
+@article{barnes2026surprisal,
+  title={Surprisal-Guided Selection: Compute-Optimal Test-Time Strategies for Execution-Grounded Code Generation},
   author={Barnes, Jarrod},
   journal={arXiv preprint},
   year={2026}

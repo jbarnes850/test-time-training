@@ -13,7 +13,6 @@ ruff_cache/
 .claude/
 configs/
 runs/
-runs_archive/
 arxiv/
 docs/REVIEWER_PERSONA.md
 scripts/REMOTE_UPLOAD_GUIDE.md
@@ -35,3 +34,31 @@ AGENTS.md
 model_cards/
 artifacts/manifest.json
 *.log
+
+# Compiled outputs
+docs/technical_report.pdf
+
+# Stale/unused figures
+artifacts/fig3_feedback.png
+artifacts/fig_environment_old.png
+artifacts/fig_teaser_optionA.png
+artifacts/fig_teaser_optionB.png
+
+# Figure generation scripts (dev-only)
+artifacts/generate_*.py
+artifacts/regenerate_*.py
+
+# Untracked dev scripts
+docs/paper_notes.md
+scripts/analyze_*.py
+scripts/compute_base_logprobs.py
+scripts/evaluate_bon_samples.py
+scripts/gpu_session.sh
+scripts/probe_world_model.py
+scripts/run_experiment_waves.sh
+tests/test_analysis_scripts_dryrun.py
+
+# Experiment data backups
+runs_h100_backup/
+runs_archive/
+verification_reports/

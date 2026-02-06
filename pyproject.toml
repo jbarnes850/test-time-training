@@ -4,7 +4,7 @@ version = "0.1.0"
 description = "KernelBench L1 RL environment scaffold"
 readme = "README.md"
 requires-python = ">=3.11"
-license = { text = "MIT" }
+license = { text = "Apache-2.0" }
 dependencies = [
   "datasets>=2.19.0",
   "numpy>=1.24.0",
@@ -19,6 +19,7 @@ dependencies = [
   "termcolor",
   "pandas",
   "matplotlib",
+  "scipy>=1.11.0",
 ]
 
 [project.optional-dependencies]
