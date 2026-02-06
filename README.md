@@ -1,6 +1,5 @@
 # Surprisal-Guided Selection
 
-[![Paper](https://img.shields.io/badge/Paper-arXiv%20Preprint-red)](docs/paper.md)
 [![Model](https://img.shields.io/badge/Model-HuggingFace-yellow)](https://huggingface.co/Jarrodbarnes/KernelBench-RLVR-120b)
 [![License](https://img.shields.io/badge/License-Apache%202.0-blue)](LICENSE)
 
@@ -14,31 +13,13 @@ This repository contains the code for reproducing the experiments in our paper o
 
 | Finding | Result | Evidence |
 |---------|--------|----------|
-| **Search dominates adaptation** | Best-of-N K=64: 100% task success; TTT BoA: 35% | TTT equivalent K < 1, worse than random single sample |
+| **Search outperforms minimal adaptation** | Best-of-N K=64: 90% task success (18/20 L1 tasks); TTT BoA: 30.6% (3-seed mean) | TTT equivalent K < 1, worse than single-sample inference |
 | **Surprisal-guided selection** | 80% success vs 50% for confidence-guided | Highest-surprisal correct samples yield best kernels at zero cost |
 | **Over-sharpening mechanism** | TTT collapses diversity toward mediocre solutions | Gradient updates concentrate probability on early successes, missing the distribution tail |
 
+*fast_1: fraction of samples that are both correct and achieve speedup > 1x over the reference implementation.*
+
 ![Adaptation Trajectory](artifacts/fig2_trajectory.png)
-
-## Results Summary
-
-**Selection Strategy Results (Subset 1, 2 seeds, K=64)**
-
-| Strategy | fast_1 | std | Mean Speedup |
-|----------|--------|-----|--------------|
-| best-correct (Oracle) | 100% | 0% | 226.9x |
-| **surprisal-guided-top3** | **100%** | **0%** | **139.0x** |
-| **surprisal-guided** | **80%** | **0%** | **41.2x** |
-| random-correct | 59.2% | 2.7% | 30.0x |
-| confidence-guided | 50% | 14.1% | 11.6x |
-
-**Best-of-N Scaling Curve**
-
-| Samples (K) | Task Success | Saturates? |
-|-------------|-------------|------------|
-| 1 | 53.3% | |
-| 16 | 99.9% | Practical saturation |
-| 64 | 100% | Oracle ceiling |
 
 ## Quick Start
 

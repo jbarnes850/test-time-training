@@ -8,7 +8,7 @@
 
 Test-time training (TTT) has emerged as a paradigm for adapting language models through gradient-based updates at inference. But is adaptation the right strategy? We study compute-optimal test-time strategies for verifiable execution-grounded (VEG) tasks, domains like GPU kernel optimization where a deterministic evaluator provides dense, continuous reward signals.
 
-Using KernelBench as our testbed and a 120B-parameter model (GPT-OSS-120B with LoRA adaptation), we find that **search outperforms minimal adaptation (1-5 gradient steps)**: Best-of-N sampling achieves 100% task success at K=64 while TTT's best checkpoint reaches only 30.6% (3-seed mean), with TTT's "equivalent K" falling below 1—worse than a single random correct sample. The failure mode is over-sharpening: gradient updates collapse diversity toward mediocre solutions rather than discovering optimal ones.
+Using KernelBench as our testbed and a 120B-parameter model (GPT-OSS-120B with LoRA adaptation), we find that **search outperforms minimal adaptation (1-5 gradient steps)**: Best-of-N sampling achieves 90% task success (18/20 tasks) at K=64 across the full KernelBench L1 eval set while TTT's best checkpoint reaches only 30.6% (3-seed mean), with TTT's "equivalent K" falling below 1—worse than single-sample inference. The failure mode is over-sharpening: gradient updates collapse diversity toward mediocre solutions rather than discovering optimal ones.
 
 Our main contribution is **surprisal-guided selection**: selecting the *highest-surprisal* (lowest-confidence) correct sample yields 80% success vs 50% for most-confident selection, a 30% improvement. Extending to surprisal-guided-top3 (evaluating the 3 highest-surprisal correct samples) matches oracle performance at 100%. This inverse relationship between model confidence and kernel quality—validated through length-controlled analysis—provides a practical, zero-cost selection strategy that recovers oracle performance.
 
@@ -32,7 +32,7 @@ This paper studies compute-optimal test-time strategies for verifiable execution
 
 Recent work on test-time training (TTT) has shown impressive results through extended gradient-based adaptation. TTT-Discover (Yuksekgonul et al., 2026) reports costs of "a few hundred dollars per problem" using ~50 adaptation steps on discovery tasks. This raises a fundamental question: **is adaptation the right strategy for dense-reward VEG tasks, or does simple search suffice?**
 
-We answer this question through controlled experiments comparing Best-of-N sampling against batch test-time training under matched compute budgets. Using GPT-OSS-120B (a 120B-parameter frontier model) with LoRA adaptation, we evaluate 10 KernelBench L1 tasks across 2 seeds. The results are decisive. Best-of-N at K=64 achieves 100% task success (finding at least one fast correct kernel per task) while TTT's best checkpoint (Best-of-Adaptation) reaches only 35%. Computing TTT's "equivalent K" (the Best-of-N budget needed to match TTT performance) yields K < 1, meaning TTT underperforms *random sampling of a single correct solution*.
+We answer this question through controlled experiments comparing Best-of-N sampling against batch test-time training under matched compute budgets. Using GPT-OSS-120B (a 120B-parameter frontier model) with LoRA adaptation, we evaluate all 20 KernelBench L1 eval tasks. The results are decisive. Best-of-N at K=64 achieves 90% task success (18/20 tasks, finding at least one fast correct kernel per task) while TTT's best checkpoint (Best-of-Adaptation) reaches only 35%. Computing TTT's "equivalent K" (the Best-of-N budget needed to match TTT performance) yields K < 1, meaning TTT underperforms *single-sample inference (K=1)*.
 
 The failure mode is **over-sharpening**: gradient updates collapse the policy toward mediocre solutions that happened to succeed early, destroying the diversity needed to find optimal kernels in the distribution tail. Ji et al. (2026) predict that RL gains arise from distribution sharpening rather than discovering new strategies; our failure mode confirms this.
 
@@ -40,7 +40,7 @@ The failure mode is **over-sharpening**: gradient updates collapse the policy to
 
 Three contributions emerge from our experiments:
 
-1. **Search outperforms minimal adaptation (1-5 GRPO steps) for dense-reward VEG tasks.** Best-of-N scaling saturates at K=16 (99.9% success), while TTT equivalent K < 1. Practitioners should invest in sample diversity, not gradient updates.
+1. **Search outperforms minimal adaptation (1-5 GRPO steps) for dense-reward VEG tasks.** Best-of-N scaling saturates at K=16 (99.9% success on 5-task subsets; 90% on the full 20-task L1 eval), while TTT equivalent K < 1. Practitioners should invest in sample diversity, not gradient updates.
 
 2. **Surprisal-guided selection recovers oracle performance.** Selecting from the high-surprisal tail—solutions the model "didn't expect to find"—provides a practical, zero-cost selection strategy.
 
@@ -60,7 +60,7 @@ For execution-grounded domains with dense rewards, compute should be allocated t
 
 **Verifiable Execution-Grounded Tasks.** We focus on VEG tasks—domains where a deterministic evaluator provides ground-truth feedback without human judgment. GPU kernel optimization is the primary example: KernelBench (Ouyang et al., 2025) evaluates 250 workloads on correctness and speedup, with speedup ranging continuously from 0x to 10x+. Related VEG domains include assembly superoptimization (SuperCoder, 2025) and formal theorem proving. The VEG setting enables our surprisal-guided selection strategy: execution feedback allows filtering to correct samples before applying surprisal-based selection.
 
-**Kernel Optimization.** Prior work on LLM-based kernel optimization has not studied selection strategies. Kevin (Baronio et al., 2025) achieves 82% correctness through multi-turn train-time RL but keeps weights frozen at inference. CUDA-L2 (2025) surpasses cuBLAS by 19.2% through two-stage GRPO. Magellan (Jan 2026) requires ~1.5 days of evolutionary search. AccelOpt (2025) uses "Optimization Memory" for kernel search. Our contribution is orthogonal: we show that intelligent selection among diverse samples recovers oracle performance without adaptation or extended search.
+**Kernel Optimization.** Prior work on LLM-based kernel optimization has not studied selection strategies. Kevin (Baronio et al., 2025) achieves 82% correctness through multi-turn train-time RL but keeps weights frozen at inference. CUDA-L2 (2025) surpasses cuBLAS by 19.2% through two-stage GRPO. Magellan (Jan 2026) requires ~1.5 days of evolutionary search. AccelOpt (2025) uses "Optimization Memory" for kernel search. Concurrent work develops richer training-time RL pipelines: Dr. Kernel (Liu et al., Feb 2026) introduces KernelGYM with reward hacking checks and TRLOO, a debiased alternative to GRPO, achieving 31.6% Fast@1.2 on KernelBench L2 through sequential multi-turn refinement; CUDA-L1 (Li et al., 2025) trains a contrastive RL model achieving 3.12x average speedup across all 250 KernelBench tasks; QiMeng-Kernel (AAAI 2026) decouples strategy from implementation via hierarchical RL. These works optimize how to *train* kernel-generating policies. We study a different question: given a capable policy, how should *test-time compute* be allocated between sampling, selection, and gradient adaptation?
 
 ---
 
@@ -68,7 +68,7 @@ For execution-grounded domains with dense rewards, compute should be allocated t
 
 ![Execution-Grounded RL Environment](/artifacts/fig_environment.png)
 
-*Figure 2: Dual-loop architecture for studying test-time compute strategies. The outer loop (blue) trains a capable base policy via RLVR on 80 KernelBench tasks. The inner loop (green) serves as the experimental arena for comparing test-time strategies—TTT adaptation vs. Best-of-N search—under matched compute budgets. Both loops share the same execution-grounded evaluator (orange), enabling fair comparison. This design isolates the research question: given a capable base policy, what is the compute-optimal test-time strategy?*
+*Figure 2: Dual-loop architecture for studying test-time compute strategies. The outer loop (blue) trains a capable base policy via reinforcement learning from verifiable rewards (RLVR) on 80 KernelBench tasks. The inner loop (green) serves as the experimental arena for comparing test-time strategies—TTT adaptation vs. Best-of-N search—under matched compute budgets. Both loops share the same execution-grounded evaluator (orange), enabling fair comparison. This design isolates the research question: given a capable base policy, what is the compute-optimal test-time strategy?*
 
 ### 3.1 Dual-Loop Architecture
 
@@ -80,8 +80,8 @@ We address this through a **dual-loop architecture** (Figure 2):
 
 **Inner Loop (Test-Time Strategies).** The inner loop is the experimental arena. Given the trained base policy and a held-out evaluation set (5 tasks), we compare multiple test-time strategies under matched compute budgets:
 - **Best-of-N search**: Sample K candidates, select via oracle/surprisal-guided/random
-- **Batch TTT adaptation**: Perform gradient updates, apply BoA checkpoint selection
-- **SDPO self-distillation**: Token-level distillation with/without execution feedback
+- **Batch TTT adaptation**: Perform gradient updates, apply Best-of-Adaptation (BoA) checkpoint selection
+- **Self-Distilled Policy Optimization (SDPO) self-distillation**: Token-level distillation with/without execution feedback
 
 All strategies use the same base checkpoint, temperature (0.25), and maximum tokens (1024). The key variable is *how* test-time compute is allocated: sampling diversity vs. gradient adaptation.
 
@@ -101,7 +101,7 @@ Training uses normalized rewards (baseline-relative speedup per task) for stabil
 
 ### 3.4 Test-Time Strategies (Inner Loop)
 
-At test time, we adapt the trained checkpoint to held-out evaluation tasks using batch updates inspired by TTRL (Zuo et al., 2025). Each adaptation step processes N=5 tasks jointly, sampling K=32 rollouts per task to produce 160 samples per step. A GRPO gradient update is computed across all rollouts, and the rank-16 LoRA adapter is updated in-place. Unlike TTT-Discover's ~50-step full RL, we use minimal adaptation (1-5 steps) to enable controlled comparison with search baselines under matched sample budgets.
+At test time, we adapt the trained checkpoint to held-out evaluation tasks using batch updates inspired by Test-Time Reinforcement Learning (TTRL; Zuo et al., 2025). Each adaptation step processes N=5 tasks jointly, sampling K=32 rollouts per task to produce 160 samples per step. A GRPO gradient update is computed across all rollouts, and the rank-16 LoRA adapter is updated in-place. Unlike TTT-Discover's ~50-step full RL, we use minimal adaptation (1-5 steps) to enable controlled comparison with search baselines under matched sample budgets.
 
 ### 3.5 Best-of-Adaptation (BoA)
 
@@ -176,6 +176,8 @@ The key methodological contribution is rigorous budget matching. Both methods us
 
 **Subset 2 (Robustness)**: Tasks {18, 28, 29, 30, 32} (offset=5). Best-of-N baseline: 40.5% fast_1.
 
+**Extended Eval (Full L1)**: Tasks {36, 55, 65, 70, 76, 82, 87, 89, 95, 98} complete the full 20-task L1 eval set (seed 42). Best-of-N and logprob analysis reported; per-sample selection analysis pending.
+
 ### 4.5 Selection Strategies
 
 We compare five selection strategies for choosing among K=64 samples per task:
@@ -187,6 +189,8 @@ We compare five selection strategies for choosing among K=64 samples per task:
 | confidence-guided | Highest mean-logprob among correct samples | Zero-cost |
 | **surprisal-guided** | **Highest-surprisal (lowest mean-logprob) among correct** | **Zero-cost** |
 | **surprisal-guided-top3** | **Best speedup among 3 highest-surprisal correct** | **3 evals** |
+
+*All strategies share correctness-checking of all K samples. The "Cost" column shows additional speedup timing evaluations beyond shared filtering.*
 
 The surprisal-guided strategies are motivated by probing experiments (Section 5.2) showing an inverse correlation between model confidence and kernel quality. The intuition: the model's highest-surprisal correct samples are solutions it "didn't expect to find"—often the creative, hardware-aware optimizations that yield maximum speedup.
 
@@ -218,9 +222,11 @@ The central finding is that **Best-of-N search decisively outperforms test-time 
 | 32 | 100% | 0% | [100%, 100%] |
 | 64 | 100% | 0% | [100%, 100%] |
 
+*pass@1 here denotes the probability that a randomly drawn sample is both correct and achieves speedup > 1x (i.e., fast_1 as defined in Section 4.3).*
+
 Performance saturates at K=16 with 99.9% success. Beyond this point, marginal gains are near-zero, establishing that **modest sampling budgets suffice** for dense-reward VEG tasks.
 
-**TTT Equivalent K < 1**: TTT's Best-of-Adaptation achieves 30.6% fast_1 (3-seed mean). Interpolating on the scaling curve, this falls *below* K=1 (53.3%), meaning TTT is **worse than randomly selecting a single correct sample**. Best-of-N at K=64 achieves 100% (oracle upper bound).
+**TTT Equivalent K < 1**: TTT's Best-of-Adaptation achieves 30.6% fast_1 (3-seed mean). Interpolating on the scaling curve, this falls *below* K=1 (53.3%), meaning TTT is **worse than drawing a single sample (K=1)**. Best-of-N at K=64 achieves 100% (oracle upper bound).
 
 **Table 5.2: TTT vs Best-of-N Summary**
 
@@ -276,7 +282,7 @@ Concretely, high-quality kernels often require:
 - Creative loop structures that deviate from common idioms
 - Hardware-specific optimizations not well-represented in training data
 
-These rare solutions occupy high-surprisal regions of the model's distribution. The key insight: **the model already knows which solutions are best; that knowledge is encoded in the surprisal signal, not the confidence signal.** Unlike S* (Li et al., 2025), which requires additional LLM calls to differentiate candidates, surprisal-guided selection extracts this signal at zero cost from existing logprobs.
+These rare solutions occupy high-surprisal regions of the model's distribution. The key insight: **the model already knows which solutions are best; that knowledge is encoded in the surprisal signal, not the confidence signal.** Unlike S* (Li et al., 2025), which requires additional LLM calls to differentiate candidates, surprisal-guided selection extracts this signal at zero cost from existing log-probabilities.
 
 **Length-Controlled Analysis**
 
@@ -303,9 +309,15 @@ The partial correlation (controlling for code length) is essentially zero (ρ = 
 
 Q2 (second-highest surprisal) shows the highest fast_1 (81.0%), while Q4 (lowest surprisal) shows the lowest (43.9%). The high-surprisal half of the distribution (Q1+Q2) averages 64.2% fast_1 versus 58.1% for the low-surprisal half (Q3+Q4). This pattern suggests the optimal selection point is in the high-surprisal region but not the extreme tail.
 
+**Logprob Variance and Selection Applicability.** Expanding logprob analysis to all 20 L1 eval tasks reveals a prerequisite for surprisal-guided selection: sufficient intra-task logprob variance. Of 20 tasks, 9 exhibit high variance (logprob std > 1.0), where diverse solution strategies create a logprob gradient for selection to exploit. The remaining 11 tasks produce near-identical logprobs across samples (std < 0.15 for 7 tasks). These are primarily convolution and normalization operations where the reference uses cuDNN (already near-optimal); the model converges to a narrow template with minimal speedup headroom (sample_fast_1 of 7-23%, selected speedup 1.00-1.22x). On such tasks, all selection strategies degenerate to random. The surprisal-guided effect is concentrated in tasks where diverse optimization strategies exist---precisely the tasks where selection provides leverage.
+
+![Adaptation trajectory](/artifacts/fig2_trajectory.png)
+
+*Figure 5: Adaptation trajectory. Performance peaks at 1-2 steps then regresses. Stars mark BoA-selected checkpoints.*
+
 ### 5.3 TTT Trajectory: Why Adaptation Fails
 
-To understand why TTT underperforms, we examine the adaptation trajectory:
+To understand why TTT underperforms, we examine the adaptation trajectory (Figure 5):
 
 **Seed 42 Trajectory (Tasks 4, 5, 12, 14, 15):**
 
@@ -356,7 +368,7 @@ We take 320 fixed Best-of-N samples (K=64, seed 42) with known speedups and comp
 
 ![Over-sharpening probe](/artifacts/fig_rho_trajectory.png)
 
-*Figure: Spearman rho(NLL, speedup) across TTT steps for 320 fixed samples. The negative correlation deepens overall: adaptation makes the model progressively more confident about its worst solutions. Bottom-quartile rho nearly doubles from -0.24 to -0.44.*
+*Figure 6: Spearman rho(NLL, speedup) across TTT steps for 320 fixed samples. The negative correlation deepens overall: adaptation makes the model progressively more confident about its worst solutions. Bottom-quartile rho nearly doubles from -0.24 to -0.44.*
 
 The Spearman rho between NLL and speedup deepens overall from -0.198 (step 0, p = 3.6e-4) to -0.275 (step 8, p = 5.7e-7). The bottom-quartile correlation (the performance-critical tail where selection operates) nearly doubles from rho = -0.237 to rho = -0.442 (step 3, p = 9.8e-17).
 
@@ -401,11 +413,13 @@ The contrasting results between subsets reveal that BoA's benefit is **regime-de
 
 **Practical Implication:** Practitioners should prefer BoA when the base policy is moderately capable, but fall back to Best-of-N search in hard regimes where the model has low coverage.
 
-Figure 5 visualizes this regime dependence, showing that tasks with >30% base coverage (green) benefit from BoA while tasks below this threshold (red) favor Best-of-N search.
+Figure 7 visualizes this regime dependence, showing that tasks with >30% base coverage (green) benefit from BoA while tasks below this threshold (red) favor Best-of-N search.
+
+**Full L1 Eval (20 Tasks).** Expanding Best-of-N to all 20 L1 eval tasks: 18/20 (90%) achieve fast_1=1 at K=64. Two failures are informative edge cases. Task 82 achieves 100% correctness but 1.00x speedup---the reference uses cuDNN, leaving no optimization headroom. Task 95 achieves 0% correctness---the model cannot generate valid kernels. Neither reflects a search strategy limitation: Task 82 is a task-level ceiling (no amount of search helps when the reference is already optimal); Task 95 is a model capability gap (no correct samples exist to select from). The 90% success rate across the full eval set, versus 100% on the 10-task subsets, reflects inclusion of tasks at both extremes of difficulty.
 
 ![Regime-Dependent Benefit](/artifacts/fig4_regime.png)
 
-*Figure 5: Regime-dependent benefit of adaptation vs. search. Tasks with >30% base coverage (green) benefit from BoA; tasks below this threshold (red) favor Best-of-N search. Interpretation: adaptation amplifies existing capability rather than creating new capability.*
+*Figure 7: Regime-dependent benefit of adaptation vs. search. Tasks with >30% base coverage (green) benefit from BoA; tasks below this threshold (red) favor Best-of-N search. Interpretation: adaptation amplifies existing capability rather than creating new capability.*
 
 **Evaluation Note:** Results use fast-proxy evaluation (5 performance trials). Full benchmark evaluation (50 trials) planned for camera-ready.
 
@@ -468,7 +482,7 @@ TTT-Discover (Yuksekgonul et al., 2026) was published during the preparation of 
 
 Our results complement rather than contradict TTT-Discover by identifying a key variable that determines optimal adaptation duration: reward density. In sparse-reward discovery tasks where qualitatively different solutions require extensive exploration, extended adaptation may be necessary. In VEG domains with dense continuous rewards, gradient signal saturates after minimal adaptation. When the world provides sparse binary feedback, extended exploration and rich teacher feedback are warranted; when the world provides continuous scalars (as in kernel optimization), 1-2 steps extract most available signal before over-sharpening degrades performance.
 
-Our TTT experiments use vanilla GRPO without the entropy regularization, reuse buffers, and extended rollout budgets (512 per step) employed by TTT-Discover. Our total budget is 320 rollouts versus TTT-Discover's 25,600. Whether those mechanisms and budgets prevent over-sharpening in dense-reward VEG domains remains untested.
+Our TTT experiments use vanilla GRPO without the entropy regularization, reuse buffers, and extended rollout budgets (512 per step) employed by TTT-Discover. Our total budget is 320 rollouts versus TTT-Discover's 25,600. Whether those mechanisms and budgets prevent over-sharpening in dense-reward VEG domains remains untested. Dr. Kernel's TRLOO algorithm (Liu et al., 2026) addresses GRPO's self-inclusion bias; whether TRLOO prevents over-sharpening in dense-reward VEG TTT remains an open question.
 
 **Objective mismatch.** TTT-Discover optimizes for "find a new SOTA solution" and returns the best solution across all steps (argmax reward). Our evaluation uses fast_1 (correct and speedup > 1x) on KernelBench L1 with K capped at 64. These are different targets; our findings apply to budgeted inference, not open-ended discovery.
 
@@ -502,13 +516,13 @@ Three open questions remain. First, an **entropy-regularized TTT** baseline (clo
 
 ## 7. Limitations
 
-This work has several limitations that suggest directions for future research. Our experiments cover 10 tasks from KernelBench L1 (5 moderate, 5 hard) across 2 seeds, representing a subset of the 20 available evaluation tasks and leaving open whether findings transfer to the full distribution. All experiments use a single 120B parameter model; transfer to other model sizes and architectures remains untested. We evaluate only KernelBench L1 tasks; the harder L2 and L3 levels may exhibit different adaptation dynamics.
+This work has several limitations that suggest directions for future research. Best-of-N evaluation covers all 20 KernelBench L1 eval tasks (90% task success at K=64). Selection strategy analysis uses 10 tasks (2 subsets x 2 seeds); full 20-task selection analysis requires pending per-sample evaluation. All experiments use a single 120B-parameter model; transfer to other sizes and architectures remains untested. We evaluate only L1 tasks; harder L2 and L3 levels may exhibit different dynamics.
 
 Our TTT experiments scope to vanilla GRPO (see Section 6.4 for discussion of differences from TTT-Discover).
 
 With n=10 binary outcomes (5 tasks x 2 seeds), our primary selection comparison (80% vs. 50%) has limited statistical power for binary tests (exact sign test p = 0.125). We supplement with continuous speedup analysis.
 
-The surprisal-guided selection strategy requires multiple correct samples per task; on harder levels (L2/L3) or tasks where the base policy has low coverage, the effect may diminish or vanish.
+The surprisal-guided selection strategy requires multiple correct samples per task; on harder levels (L2/L3) or tasks where the base policy has low coverage, the effect may diminish or vanish. Moreover, surprisal-guided selection requires sufficient intra-task logprob variance. On 11/20 L1 tasks where the model produces near-identical solutions (logprob std < 1.0), the selection signal vanishes and all strategies perform equivalently.
 
 Our evaluation uses a fast-proxy protocol (5 timing trials per kernel); rankings could shift under the full KernelBench protocol (50 trials). We validated selected kernels on H100 hardware and observed consistent rankings, but a full-protocol replication on a larger subset would strengthen these results.
 
@@ -520,7 +534,7 @@ Finally, we provide empirical findings without theoretical grounding. Why does t
 
 ## 8. Conclusion
 
-We study compute-optimal test-time strategies for verifiable execution-grounded tasks, demonstrating on 10 KernelBench L1 tasks across 2 seeds that **search outperforms minimal adaptation (1-5 gradient steps)** for GPU kernel optimization. Best-of-N sampling achieves 100% task success at K=64 while TTT's best checkpoint reaches only 30.6% (3-seed mean)—with TTT's "equivalent K" falling below 1, meaning adaptation underperforms random sampling.
+We study compute-optimal test-time strategies for verifiable execution-grounded tasks, demonstrating across all 20 KernelBench L1 eval tasks that **search outperforms minimal adaptation (1-5 gradient steps)** for GPU kernel optimization. Best-of-N sampling achieves 90% task success (18/20) at K=64 while TTT's best checkpoint reaches only 30.6% (3-seed mean)—with TTT's "equivalent K" falling below 1, meaning adaptation underperforms single-sample inference.
 
 Three findings characterize the compute-optimal strategy:
 
@@ -715,6 +729,28 @@ We thank Thinking Machines Lab for access to the Tinker training infrastructure.
   journal={arXiv preprint arXiv:2511.15915},
   year={2025},
   note={Uses Optimization Memory for kernel search}
+}
+
+@article{drkernel2026,
+  title={Dr. Kernel: Reinforcement Learning Done Right for Triton Kernel Generations},
+  author={Liu, Wei and Xu, Jiawei and Li, Yingru and Zheng, Longtao and Li, Tianjian and Liu, Qian and He, Junxian},
+  journal={arXiv preprint arXiv:2602.05885},
+  year={2026}
+}
+
+@article{cudal1_2025,
+  title={CUDA-L1: Improving CUDA Optimization via Contrastive Reinforcement Learning},
+  author={Li, Xiaoya and Sun, Xiaofei and Wang, Albert and Li, Jiwei and Shum, Chris},
+  journal={arXiv preprint arXiv:2507.14111},
+  year={2025}
+}
+
+@article{qimeng2025,
+  title={QiMeng-Kernel: Macro-Thinking Micro-Coding Paradigm for LLM-Based High-Performance GPU Kernel Generation},
+  author={{QiMeng Team}},
+  journal={arXiv preprint arXiv:2511.20100},
+  year={2025},
+  note={Accepted to AAAI 2026}
 }
 ```
 
