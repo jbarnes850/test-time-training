@@ -1,5 +1,6 @@
 # Surprisal-Guided Selection
 
+[![Paper](https://img.shields.io/badge/Paper-arXiv%3A2602.07670-red)](http://arxiv.org/abs/2602.07670)
 [![Model](https://img.shields.io/badge/Model-HuggingFace-yellow)](https://huggingface.co/Jarrodbarnes/KernelBench-RLVR-120b)
 [![License](https://img.shields.io/badge/License-Apache%202.0-blue)](LICENSE)
 
@@ -147,8 +148,9 @@ tokenizer = AutoTokenizer.from_pretrained("Jarrodbarnes/KernelBench-RLVR-120b")
 @article{barnes2026surprisal,
   title={Surprisal-Guided Selection: Compute-Optimal Test-Time Strategies for Execution-Grounded Code Generation},
   author={Barnes, Jarrod},
-  journal={arXiv preprint},
-  year={2026}
+  journal={arXiv preprint arXiv:2602.07670},
+  year={2026},
+  url={http://arxiv.org/abs/2602.07670}
 }
 ```
 
