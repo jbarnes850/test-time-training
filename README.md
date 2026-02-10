@@ -16,9 +16,9 @@ Compute-Optimal Test-Time Strategies for Execution-Grounded Code Generation
 
 Test-time training (TTT) adapts language models through gradient-based updates at inference. But is adaptation the right strategy? We study compute-optimal test-time strategies for verifiable execution-grounded (VEG) tasks, domains where a deterministic evaluator provides dense, continuous reward signals.
 
-Using [KernelBench](https://github.com/ScalingIntelligence/KernelBench) (250 GPU kernel optimization tasks) as our testbed and a 120B-parameter model (GPT-OSS-120B with LoRA adaptation), we find that **search outperforms minimal adaptation**: Best-of-N sampling achieves 90% task success (18/20 Level-1 tasks) at K=64, while TTT's best checkpoint reaches only 30.6% (3-seed mean), with TTT's "equivalent K" falling below 1 -- worse than single-sample inference. The failure mode is **over-sharpening**: gradient updates collapse diversity toward mediocre solutions rather than discovering optimal ones.
+Using [KernelBench](https://github.com/ScalingIntelligence/KernelBench) (250 GPU kernel optimization tasks) as our testbed and a 120B-parameter model (GPT-OSS-120B with LoRA adaptation), we find that **search outperforms minimal adaptation**: Best-of-N sampling achieves 90% task success (18/20 Level-1 tasks) at K=64, while TTT's best checkpoint reaches only 30.6% (3-seed mean), with TTT's "equivalent K" falling below 1, worse than single-sample inference. The failure mode is **over-sharpening**: gradient updates collapse diversity toward mediocre solutions rather than discovering optimal ones.
 
-Our main contribution is **surprisal-guided selection**: selecting the *highest-surprisal* (lowest-confidence) correct sample yields 80% success vs. 50% for most-confident selection. Extending to surprisal-guided-top3 matches oracle performance at 100%. The model's probability distribution maps frequency, not quality -- rare, hardware-optimized kernels occupy the Expert Tail that surprisal recovers at zero cost.
+Our main contribution is **surprisal-guided selection**: selecting the *highest-surprisal* (lowest-confidence) correct sample yields 80% success vs. 50% for most-confident selection. Extending to surprisal-guided-top3 matches oracle performance at 100%. The model's probability distribution maps frequency, not quality. Rare, hardware-optimized kernels occupy the Expert Tail that surprisal recovers at zero cost.
 
 <p align="center">
   <img src="artifacts/fig_teaser_new.png" alt="Test-time strategy comparison" width="80%">
@@ -36,15 +36,15 @@ Our main contribution is **surprisal-guided selection**: selecting the *highest-
 
 ## Results
 
-All results use the 20 KernelBench Level-1 eval tasks. **fast_1** measures the fraction of samples that are both functionally correct and achieve speedup > 1x over the reference PyTorch implementation.
+Best-of-N covers all 20 KernelBench Level-1 eval tasks; selection analysis uses Subset 1 (5 tasks, 2 seeds). **fast_1** measures the fraction of samples that are both functionally correct and achieve speedup > 1x over the reference PyTorch implementation.
 
 ### Search Outperforms Adaptation
 
-Best-of-N at K=64 achieves 90% task success (18/20 tasks). TTT's Best-of-Adaptation reaches 30.6% fast_1 (3-seed mean). Interpolating on the scaling curve, TTT falls below K=1 (53.3%), meaning it is worse than drawing a single random sample. Performance saturates at K=16 -- modest sampling budgets suffice for dense-reward VEG tasks.
+Best-of-N at K=64 achieves 90% task success (18/20 tasks). TTT's Best-of-Adaptation reaches 30.6% fast_1 (3-seed mean). Interpolating on the scaling curve, TTT falls below K=1 (53.3%), meaning it is worse than drawing a single random sample. Performance saturates at K=16. Modest sampling budgets suffice for dense-reward VEG tasks.
 
 ### Surprisal-Guided Selection
 
-Given K=64 samples per task, standard practice selects the most confident output. We find the opposite works: selecting the *least* confident correct sample achieves 80% fast_1 vs. 50% for confidence-guided (+30pp, Cohen's h = 0.64). Evaluating just the top 3 by surprisal and picking the fastest matches oracle at 100%. The signal is already in the log-probabilities -- no additional inference cost.
+Given K=64 samples per task, standard practice selects the most confident output. We find the opposite works: selecting the *least* confident correct sample achieves 80% fast_1 vs. 50% for confidence-guided (+30pp, Cohen's h = 0.64). Evaluating just the top 3 by surprisal and picking the fastest matches oracle at 100%. The signal is already in the log-probabilities. No additional inference cost.
 
 <p align="center">
   <img src="artifacts/fig_selection_strategies.png" alt="Selection strategy comparison" width="80%">
