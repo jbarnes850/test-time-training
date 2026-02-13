@@ -128,6 +128,7 @@ class DryRunMutatorBackend:
         seed_task: KernelTask,
         prompt: str,
         *,
+        system_prompt: str,
         temperature: float,
         max_tokens: int,
     ) -> str:
@@ -308,7 +309,17 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--renderer_name", type=str, default="gpt_oss_no_sysprompt")
     parser.add_argument("--mutator_backend", type=str, default="tinker", choices=["tinker", "api_stub"])
     parser.add_argument("--mutator_model_path", type=str, default="moonshotai/Kimi-K2.5")
+    parser.add_argument("--mutator_renderer_name", type=str, default="")
+    parser.add_argument("--mutator_request_timeout_s", type=float, default=180.0)
     parser.add_argument("--mutator_max_retries", type=int, default=3)
+    parser.add_argument(
+        "--mutator_semantic_filter",
+        type=str,
+        default="off",
+        choices=["off", "fast"],
+    )
+    parser.add_argument("--mutator_semantic_correct_trials", type=int, default=1)
+    parser.add_argument("--mutator_semantic_perf_trials", type=int, default=1)
     parser.add_argument("--teacher_strategy", type=str, default="inverse_correctness")
     parser.add_argument("--replay_recency_window", type=int, default=200)
     parser.add_argument("--log_path", type=str, default="runs/adaptive_phase1")
@@ -347,6 +358,7 @@ def main(argv: list[str] | None = None) -> int:
     epoch_summary_path = run_dir / "epoch_summary.jsonl"
     capability_profiles_path = run_dir / "capability_profiles.jsonl"
     replay_path = run_dir / "replay_entries.jsonl"
+    mutator_stats_path = run_dir / "mutator_stats.jsonl"
 
     replay_buffer = ReplayBuffer(replay_path)
     teacher = CurriculumTeacher(seed=args.seed)
@@ -386,7 +398,11 @@ def main(argv: list[str] | None = None) -> int:
         )
         solver = TinkerSolverBackend(config=solver_config)
         if args.mutator_backend == "tinker":
-            mutator_backend = TinkerMutatorBackend(model_id=args.mutator_model_path)
+            mutator_backend = TinkerMutatorBackend(
+                model_id=args.mutator_model_path,
+                renderer_name=args.mutator_renderer_name or None,
+                request_timeout_s=args.mutator_request_timeout_s,
+            )
         else:
             mutator_backend = ApiMutatorBackend(model_id=args.mutator_model_path)
 
@@ -405,6 +421,9 @@ def main(argv: list[str] | None = None) -> int:
         max_retries=args.mutator_max_retries,
         temperature=args.temperature,
         max_tokens=args.max_tokens,
+        semantic_filter=args.mutator_semantic_filter,
+        semantic_correct_trials=args.mutator_semantic_correct_trials,
+        semantic_perf_trials=args.mutator_semantic_perf_trials,
     )
 
     next_epoch = 0
@@ -418,6 +437,7 @@ def main(argv: list[str] | None = None) -> int:
     start_epoch = next_epoch
 
     for epoch in range(start_epoch, args.epochs):
+        mutator.reset_stats()
         remaining_epochs = args.epochs - epoch
         projected_total = cost_tracker.projected_total(
             remaining_epochs=remaining_epochs,
@@ -474,7 +494,14 @@ def main(argv: list[str] | None = None) -> int:
                 api_usd=0.0 if args.dry_run else args.mutate_api_usd_per_task,
                 epoch=epoch,
             )
-            mutated = mutator.mutate(seed_task, epoch=epoch, seed_problem_id=seed_problem_id)
+            mutator_target_category = seed_category
+            mutated = mutator.mutate(
+                seed_task,
+                epoch=epoch,
+                seed_problem_id=seed_problem_id,
+                target_category=mutator_target_category,
+                level=args.level_train,
+            )
             if mutated is None:
                 bank_eval = EvalResult(
                     compiled=False,
@@ -569,6 +596,13 @@ def main(argv: list[str] | None = None) -> int:
         }
         _write_json(checkpoint_state_path, checkpoint_payload)
         _append_jsonl(
+            mutator_stats_path,
+            {
+                "epoch": epoch,
+                **mutator.stats.as_dict(),
+            },
+        )
+        _append_jsonl(
             epoch_summary_path,
             {
                 "epoch": epoch,
@@ -578,6 +612,7 @@ def main(argv: list[str] | None = None) -> int:
                 "epoch_cost_usd": epoch_cost,
                 "running_total_usd": cost_tracker.total_usd,
                 "sampler_path": solver.sampler_path,
+                "mutator_stats": mutator.stats.as_dict(),
             },
         )
 
