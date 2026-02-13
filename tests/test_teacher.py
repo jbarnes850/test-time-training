@@ -62,7 +62,7 @@ def _build_mock_tinker_backend(response_text: str, *, has_sequence: bool = True)
     backend = object.__new__(TinkerLLMTeacherBackend)
     backend._tinker = _DummyTinker()
     backend._get_text_content = lambda msg: msg.get("content", "")
-    backend._model_id = "Qwen/Qwen3-30B-A3B-Instruct-2507"
+    backend._model_id = "Qwen/Qwen3-235B-A22B-Instruct-2507"
     backend._renderer_name = "qwen3_instruct"
     backend._temperature = 0.1
     backend._max_tokens = 128
@@ -70,7 +70,7 @@ def _build_mock_tinker_backend(response_text: str, *, has_sequence: bool = True)
     backend._fallback_backend = HeuristicTeacherBackend()
     backend._sampling_client = _DummySamplingClient(_DummyResult(has_sequence=has_sequence))
     backend._renderer = _DummyRenderer(response_text)
-    backend._resolved_model_path = "base_model:Qwen/Qwen3-30B-A3B-Instruct-2507"
+    backend._resolved_model_path = "base_model:Qwen/Qwen3-235B-A22B-Instruct-2507"
     return backend
 
 
