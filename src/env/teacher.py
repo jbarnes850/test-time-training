@@ -11,7 +11,7 @@ from concurrent.futures import TimeoutError as FuturesTimeoutError
 from dataclasses import dataclass, field
 from typing import Any, Protocol
 
-from src.env.schema import CapabilityProfile
+from src.env.schema import CapabilityProfile, KernelTask
 from src.utils.tinker_utils import ensure_tinker_cookbook_on_path
 
 
@@ -371,6 +371,48 @@ def _normalize_speedup_band(value: Any, *, fallback: tuple[float, float]) -> tup
     return fallback
 
 
+def _compact_failure_exemplars(
+    failure_exemplars: list[dict[str, Any]] | None,
+    *,
+    limit: int = 8,
+) -> list[dict[str, Any]]:
+    if not failure_exemplars:
+        return []
+    compact: list[dict[str, Any]] = []
+    for row in failure_exemplars[: max(0, int(limit))]:
+        compact.append(
+            {
+                "entry_id": str(row.get("entry_id", "")),
+                "category_id": str(row.get("category_id", "")),
+                "zone": str(row.get("zone", "")),
+                "correctness": bool(row.get("correctness", False)),
+                "compiled": bool(row.get("compiled", False)),
+                "speedup": float(row.get("speedup", 0.0)),
+                "error_message": str(row.get("error_message", "")),
+            }
+        )
+    return compact
+
+
+def _fallback_seed_plan(
+    *,
+    zone: str,
+    target_speedup_band: tuple[float, float],
+    failure_exemplar_count: int,
+) -> "SeedMutationPlan":
+    return SeedMutationPlan(
+        decision_mode=_decision_mode_for_zone(zone),
+        reason_code="fallback",
+        target_speedup_band=_target_speedup_band_for_zone(zone),
+        mutation_instruction=_mutation_instruction_for_zone(zone),
+        rationale=(
+            f"Fallback seed plan for zone={zone}. "
+            f"Provided failures={failure_exemplar_count}, "
+            f"requested_band=[{target_speedup_band[0]:.2f},{target_speedup_band[1]:.2f}]"
+        ),
+    )
+
+
 def _best_profile_for_zone(profiles: list[CapabilityProfile], zone: str) -> CapabilityProfile | None:
     candidates = [p for p in profiles if p.zone == zone]
     if not candidates:
@@ -415,6 +457,15 @@ class TeacherDecision:
     normalized_utility: float = 0.0
 
 
+@dataclass(frozen=True)
+class SeedMutationPlan:
+    decision_mode: str
+    reason_code: str
+    target_speedup_band: tuple[float, float]
+    mutation_instruction: str
+    rationale: str
+
+
 class TeacherPolicyBackend(Protocol):
     @property
     def backend_name(self) -> str:
@@ -430,7 +481,20 @@ class TeacherPolicyBackend(Protocol):
         *,
         target_min_completion: float,
         target_max_completion: float,
+        failure_exemplars: list[dict[str, Any]] | None = None,
     ) -> TeacherDecision:
+        ...
+
+    def plan_seed_mutation(
+        self,
+        *,
+        seed_task: KernelTask,
+        target_category: str,
+        zone: str,
+        target_speedup_band: tuple[float, float],
+        solver_trace_summary: str,
+        failure_exemplars: list[dict[str, Any]] | None = None,
+    ) -> SeedMutationPlan:
         ...
 
 
@@ -449,6 +513,7 @@ class HeuristicTeacherBackend:
         *,
         target_min_completion: float,
         target_max_completion: float,
+        failure_exemplars: list[dict[str, Any]] | None = None,
     ) -> TeacherDecision:
         if not profiles:
             return TeacherDecision(
@@ -549,11 +614,41 @@ class HeuristicTeacherBackend:
             normalized_utility=chosen.normalized_utility,
         )
 
+    def plan_seed_mutation(
+        self,
+        *,
+        seed_task: KernelTask,
+        target_category: str,
+        zone: str,
+        target_speedup_band: tuple[float, float],
+        solver_trace_summary: str,
+        failure_exemplars: list[dict[str, Any]] | None = None,
+    ) -> SeedMutationPlan:
+        compact_failures = _compact_failure_exemplars(failure_exemplars, limit=4)
+        failure_hint = ""
+        if compact_failures:
+            first = compact_failures[0]
+            failure_hint = (
+                f" Prior failure id={first.get('entry_id','')} "
+                f"speedup={float(first.get('speedup', 0.0)):.3f} "
+                f"error={first.get('error_message','')[:120]}."
+            )
+        return SeedMutationPlan(
+            decision_mode=_decision_mode_for_zone(zone),
+            reason_code="fallback",
+            target_speedup_band=_target_speedup_band_for_zone(zone),
+            mutation_instruction=_mutation_instruction_for_zone(zone),
+            rationale=(
+                f"Heuristic seed plan for category={target_category}.{failure_hint} "
+                f"trace={solver_trace_summary[:180]}"
+            ),
+        )
+
 
 class TinkerLLMTeacherBackend:
     def __init__(
         self,
-        model_id: str = "Qwen/Qwen3-30B-A3B-Instruct-2507",
+        model_id: str = "Qwen/Qwen3-235B-A22B-Instruct-2507",
         renderer_name: str | None = None,
         *,
         temperature: float = 0.1,
@@ -625,6 +720,7 @@ class TinkerLLMTeacherBackend:
         *,
         target_min_completion: float,
         target_max_completion: float,
+        failure_exemplars: list[dict[str, Any]] | None = None,
     ) -> TeacherDecision:
         if not profiles:
             return self._fallback_backend.decide(
@@ -669,10 +765,12 @@ class TinkerLLMTeacherBackend:
             }
             for p in sorted(profiles, key=lambda x: x.category_id)
         ]
+        compact_failures = _compact_failure_exemplars(failure_exemplars, limit=8)
         user_prompt = (
             f"min_completion={target_min_completion:.4f}\n"
             f"max_completion={target_max_completion:.4f}\n"
             f"profiles={json.dumps(profile_lines, separators=(',', ':'))}\n\n"
+            f"failure_exemplars={json.dumps(compact_failures, separators=(',', ':'))}\n\n"
             "Choose one category and emit strict JSON."
         )
         messages = [
@@ -792,6 +890,104 @@ class TinkerLLMTeacherBackend:
             zone=inferred_zone,
             utility_score=chosen_profile.utility_score,
             normalized_utility=chosen_profile.normalized_utility,
+        )
+
+    def plan_seed_mutation(
+        self,
+        *,
+        seed_task: KernelTask,
+        target_category: str,
+        zone: str,
+        target_speedup_band: tuple[float, float],
+        solver_trace_summary: str,
+        failure_exemplars: list[dict[str, Any]] | None = None,
+    ) -> SeedMutationPlan:
+        compact_failures = _compact_failure_exemplars(failure_exemplars, limit=8)
+        fallback = _fallback_seed_plan(
+            zone=zone,
+            target_speedup_band=target_speedup_band,
+            failure_exemplar_count=len(compact_failures),
+        )
+        system_prompt = (
+            "You are CurriculumTeacherSeedPlanner for adaptive RL training. "
+            "Given a concrete seed task plus solver failure exemplars, produce a mutation plan "
+            "that is difficult-but-learnable and interface-preserving.\n"
+            "Return STRICT JSON only with keys:\n"
+            "decision_mode, reason_code, target_speedup_band, mutation_instruction, rationale.\n"
+            "Allowed decision_mode: learning, mastered_warmup, too_hard_decompose, fallback.\n"
+            "Allowed reason_code: edge_signal, max_variance, data_sparse, decompose, warmup, fallback.\n"
+            "Hard constraints:\n"
+            "- Keep zone-consistent mode.\n"
+            "- mutation_instruction must be specific to seed failure patterns.\n"
+            "- target_speedup_band must be 2 numbers [low, high]."
+        )
+        user_payload = {
+            "target_category": target_category,
+            "zone": zone,
+            "target_speedup_band": [round(target_speedup_band[0], 4), round(target_speedup_band[1], 4)],
+            "solver_trace_summary": solver_trace_summary,
+            "failure_exemplars": compact_failures,
+            "seed_problem_id": seed_task.problem_id,
+            "seed_name": seed_task.name,
+            "seed_reference_code": seed_task.reference_code,
+        }
+        messages = [
+            {"role": "system", "content": system_prompt},
+            {
+                "role": "user",
+                "content": json.dumps(user_payload, separators=(",", ":")),
+            },
+        ]
+        model_input = self._renderer.build_generation_prompt(messages)
+        future = self._sampling_client.sample(
+            prompt=model_input,
+            num_samples=1,
+            sampling_params=self._tinker.SamplingParams(
+                max_tokens=self._max_tokens,
+                stop=self._renderer.get_stop_sequences(),
+                temperature=self._temperature,
+            ),
+        )
+        try:
+            result = future.result(timeout=self._request_timeout_s)
+        except Exception:
+            return fallback
+        if not result.sequences:
+            return fallback
+        parsed_message, _ = self._renderer.parse_response(result.sequences[0].tokens)
+        text = self._get_text_content(parsed_message)
+        payload = _extract_json_object(text)
+        if payload is None:
+            return fallback
+
+        inferred_mode = _decision_mode_for_zone(zone)
+        mode = str(payload.get("decision_mode", "")).strip().lower()
+        if mode not in VALID_DECISION_MODES or mode != inferred_mode:
+            mode = inferred_mode
+
+        reason_code = str(payload.get("reason_code", "fallback")).strip().lower()
+        if reason_code not in VALID_REASON_CODES:
+            reason_code = "fallback"
+
+        band = _normalize_speedup_band(
+            payload.get("target_speedup_band"),
+            fallback=_target_speedup_band_for_zone(zone),
+        )
+        # Keep deterministic zone-safe band policy.
+        band = _target_speedup_band_for_zone(zone)
+        mutation_instruction = str(payload.get("mutation_instruction", "")).strip()
+        if not mutation_instruction:
+            mutation_instruction = _mutation_instruction_for_zone(zone)
+        rationale = str(payload.get("rationale", "LLM seed planner decision.")).strip()
+        if not rationale:
+            rationale = "LLM seed planner decision."
+
+        return SeedMutationPlan(
+            decision_mode=mode,
+            reason_code=reason_code,
+            target_speedup_band=band,
+            mutation_instruction=mutation_instruction,
+            rationale=rationale,
         )
 
 
@@ -917,6 +1113,7 @@ class CurriculumTeacher:
         *,
         target_min_completion: float | None = None,
         target_max_completion: float | None = None,
+        failure_exemplars: list[dict[str, Any]] | None = None,
     ) -> TeacherDecision:
         min_c = (
             self.target_min_completion
@@ -933,12 +1130,33 @@ class CurriculumTeacher:
             list(self._latest_profile.values()),
             target_min_completion=min_c,
             target_max_completion=max_c,
+            failure_exemplars=failure_exemplars,
         )
         self._latest_decision = decision
         return decision
 
     def latest_decision(self) -> TeacherDecision | None:
         return self._latest_decision
+
+    def plan_seed_mutation(
+        self,
+        *,
+        seed_task: KernelTask,
+        target_category: str,
+        zone: str,
+        target_speedup_band: tuple[float, float],
+        solver_trace_summary: str,
+        failure_exemplars: list[dict[str, Any]] | None = None,
+    ) -> SeedMutationPlan:
+        backend = self.policy_backend or HeuristicTeacherBackend()
+        return backend.plan_seed_mutation(
+            seed_task=seed_task,
+            target_category=target_category,
+            zone=zone,
+            target_speedup_band=target_speedup_band,
+            solver_trace_summary=solver_trace_summary,
+            failure_exemplars=failure_exemplars,
+        )
 
     def rank_tasks(
         self,
@@ -981,7 +1199,8 @@ class CurriculumTeacher:
             )
 
         if strategy == "frontier_band":
-            target = self.select_frontier_target().target_category
+            latest = self.latest_decision()
+            target = latest.target_category if latest is not None else self.select_frontier_target().target_category
             return sorted(
                 tasks,
                 key=lambda t: (

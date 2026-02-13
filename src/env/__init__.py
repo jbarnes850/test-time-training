@@ -21,6 +21,7 @@ from src.env.telemetry import TelemetryRecord, build_record, validate_telemetry
 from src.env.teacher import (
     CurriculumTeacher,
     HeuristicTeacherBackend,
+    SeedMutationPlan,
     TeacherDecision,
     TeacherPolicyBackend,
     TinkerLLMTeacherBackend,

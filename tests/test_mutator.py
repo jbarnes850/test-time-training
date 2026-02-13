@@ -155,8 +155,18 @@ def test_mutate_returns_mutated_task_with_lineage(tmp_path: Path):
         decision_mode="learning",
         reason_code="edge_signal",
         target_speedup_band=(1.3, 1.8),
+        failure_exemplars=[
+            {
+                "entry_id": "f_1",
+                "speedup": 1.01,
+                "correctness": True,
+                "compiled": True,
+                "error_message": "",
+            }
+        ],
         mutation_instruction="Add one operation while preserving interface.",
         solver_trace_summary="category=activation mean_speedup=1.3",
+        teacher_seed_rationale="Address repeated 1.01x failure.",
     )
     assert mutated is not None
     assert mutated.seed_problem_id == 4
@@ -171,6 +181,8 @@ def test_mutate_returns_mutated_task_with_lineage(tmp_path: Path):
     assert mutated.teacher_target_speedup_band == (1.3, 1.8)
     assert mutated.teacher_mutation_instruction
     assert mutated.solver_trace_summary
+    assert mutated.teacher_failure_entry_ids == ("f_1",)
+    assert mutated.teacher_seed_rationale
     assert mutator.stats.attempts_total == 2
     assert mutator.stats.accepted == 1
     assert mutator.stats.format_failures == 1

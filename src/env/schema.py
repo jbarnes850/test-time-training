@@ -60,6 +60,8 @@ class MutatedTask:
     teacher_target_speedup_band: tuple[float, float] = (0.0, 0.0)
     teacher_mutation_instruction: str = ""
     solver_trace_summary: str = ""
+    teacher_failure_entry_ids: tuple[str, ...] = ()
+    teacher_seed_rationale: str = ""
 
 
 @dataclass(frozen=True)

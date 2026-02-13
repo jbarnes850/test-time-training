@@ -5,7 +5,7 @@ import hashlib
 import re
 from concurrent.futures import TimeoutError as FuturesTimeoutError
 from dataclasses import dataclass
-from typing import Protocol
+from typing import Any, Protocol
 
 from src.env.replay_buffer import ReplayBuffer
 from src.env.schema import KernelTask, MutatedTask
@@ -148,6 +148,7 @@ def build_mutation_prompt(
     target_category: str | None = None,
     *,
     target_speedup_band: tuple[float, float] | None = None,
+    failure_exemplars: list[dict[str, Any]] | None = None,
     solver_trace_summary: str | None = None,
     mutation_instruction: str | None = None,
     decision_mode: str | None = None,
@@ -163,6 +164,21 @@ def build_mutation_prompt(
         speedup_hint = (
             f"Target solver speedup band: [{target_speedup_band[0]:.2f}, {target_speedup_band[1]:.2f}]\n"
         )
+    failure_hint = ""
+    if failure_exemplars:
+        max_examples = min(len(failure_exemplars), 5)
+        lines: list[str] = []
+        for idx, row in enumerate(failure_exemplars[:max_examples], start=1):
+            entry_id = str(row.get("entry_id", f"entry_{idx}"))
+            speedup = float(row.get("speedup", 0.0))
+            correctness = bool(row.get("correctness", False))
+            compiled = bool(row.get("compiled", False))
+            error = str(row.get("error_message", "")).strip()
+            error_part = f" error={error}" if error else ""
+            lines.append(
+                f"{idx}. id={entry_id} compiled={compiled} correct={correctness} speedup={speedup:.3f}{error_part}"
+            )
+        failure_hint = "Failure exemplars to address:\n" + "\n".join(lines) + "\n\n"
     trace_hint = (
         f"Solver trace summary:\n{solver_trace_summary.strip()}\n\n"
         if solver_trace_summary and solver_trace_summary.strip()
@@ -180,6 +196,7 @@ def build_mutation_prompt(
         "Prioritize difficult but learnable task variation while preserving interface contract.\n\n"
         f"{target_hint}"
         f"{speedup_hint}"
+        f"{failure_hint}"
         f"{mode_hint}"
         f"{reason_hint}"
         f"{instruction_hint}"
@@ -449,15 +466,18 @@ class KernelMutator:
         target_category: str | None = None,
         level: int = 1,
         target_speedup_band: tuple[float, float] | None = None,
+        failure_exemplars: list[dict[str, Any]] | None = None,
         solver_trace_summary: str | None = None,
         mutation_instruction: str | None = None,
         decision_mode: str | None = None,
         reason_code: str | None = None,
+        teacher_seed_rationale: str | None = None,
     ) -> MutatedTask | None:
         prompt = build_mutation_prompt(
             seed_task,
             target_category=target_category,
             target_speedup_band=target_speedup_band,
+            failure_exemplars=failure_exemplars,
             solver_trace_summary=solver_trace_summary,
             mutation_instruction=mutation_instruction,
             decision_mode=decision_mode,
@@ -503,6 +523,14 @@ class KernelMutator:
             parent_id = f"seed_{seed_problem_id if seed_problem_id is not None else seed_task.problem_id}"
             task_id = f"mut_{seed_task.problem_id}_{epoch}_{validation.novelty_hash[:12]}"
             self._stats.accepted += 1
+            failure_entry_ids: tuple[str, ...] = ()
+            if failure_exemplars:
+                ids = [
+                    str(row.get("entry_id", "")).strip()
+                    for row in failure_exemplars
+                    if str(row.get("entry_id", "")).strip()
+                ]
+                failure_entry_ids = tuple(ids[:8])
             return MutatedTask(
                 task_id=task_id,
                 parent_task_id=parent_id,
@@ -524,6 +552,8 @@ class KernelMutator:
                 teacher_target_speedup_band=target_speedup_band or (0.0, 0.0),
                 teacher_mutation_instruction=mutation_instruction or "",
                 solver_trace_summary=solver_trace_summary or "",
+                teacher_failure_entry_ids=failure_entry_ids,
+                teacher_seed_rationale=teacher_seed_rationale or "",
             )
         return None
 

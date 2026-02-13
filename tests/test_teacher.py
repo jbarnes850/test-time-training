@@ -1,4 +1,4 @@
-from src.env.schema import CapabilityProfile
+from src.env.schema import CapabilityProfile, KernelTask
 from src.env.teacher import (
     CurriculumTeacher,
     HeuristicTeacherBackend,
@@ -51,8 +51,10 @@ class _DummyFuture:
 class _DummySamplingClient:
     def __init__(self, result_obj):
         self._result_obj = result_obj
+        self.last_prompt = None
 
-    def sample(self, **_kwargs):
+    def sample(self, **kwargs):
+        self.last_prompt = kwargs.get("prompt")
         return _DummyFuture(self._result_obj)
 
 
@@ -273,6 +275,98 @@ def test_tinker_teacher_backend_parses_json_and_infers_hard_frontier():
     assert decision.reason_code == "decompose"
     assert decision.target_speedup_band == (1.2, 1.6)
     assert decision.mutation_instruction
+
+
+def test_tinker_teacher_backend_passes_failure_exemplars_to_prompt():
+    response_text = (
+        '{"target_category":"composite:activation+matmul",'
+        '"decision_mode":"too_hard_decompose",'
+        '"reason_code":"decompose",'
+        '"target_speedup_band":[1.2,1.6],'
+        '"mutation_instruction":"decompose one op while preserving interface",'
+        '"rationale":"Targeting hard composite frontier."}'
+    )
+    backend = _build_mock_tinker_backend(response_text)
+    failures = [
+        {
+            "entry_id": "e1",
+            "category_id": "composite:activation+matmul",
+            "zone": "too_hard",
+            "correctness": True,
+            "compiled": True,
+            "speedup": 1.01,
+            "error_message": "",
+        }
+    ]
+    _ = backend.decide(
+        _profiles_for_backend(),
+        target_min_completion=0.25,
+        target_max_completion=0.75,
+        failure_exemplars=failures,
+    )
+    prompt = str(backend._sampling_client.last_prompt)
+    assert "failure_exemplars" in prompt
+    assert "e1" in prompt
+
+
+def test_tinker_teacher_backend_seed_plan_parses_json():
+    response_text = (
+        '{"decision_mode":"too_hard_decompose",'
+        '"reason_code":"decompose",'
+        '"target_speedup_band":[1.2,1.6],'
+        '"mutation_instruction":"Remove one op and preserve interface to address failure pattern.",'
+        '"rationale":"Seed-specific decomposition based on repeated 1.01x failures."}'
+    )
+    backend = _build_mock_tinker_backend(response_text)
+    seed_task = KernelTask(
+        problem_id=7,
+        name="seed_task",
+        reference_code=(
+            "import torch\\nimport torch.nn as nn\\n\\n"
+            "class Model(nn.Module):\\n"
+            "    def forward(self, x):\\n"
+            "        return torch.relu(x)\\n"
+        ),
+    )
+    plan = backend.plan_seed_mutation(
+        seed_task=seed_task,
+        target_category="composite:activation+matmul",
+        zone="too_hard",
+        target_speedup_band=(1.2, 1.6),
+        solver_trace_summary="category=composite:activation+matmul zone=too_hard speedup=1.01",
+        failure_exemplars=[
+            {"entry_id": "e2", "speedup": 1.01, "correctness": True, "compiled": True},
+        ],
+    )
+    assert plan.decision_mode == "too_hard_decompose"
+    assert plan.reason_code == "decompose"
+    assert plan.target_speedup_band == (1.2, 1.6)
+    assert "interface" in plan.mutation_instruction.lower()
+
+
+def test_tinker_teacher_backend_seed_plan_fallback_on_invalid_json():
+    backend = _build_mock_tinker_backend("not-json")
+    seed_task = KernelTask(
+        problem_id=9,
+        name="seed_task",
+        reference_code=(
+            "import torch\\nimport torch.nn as nn\\n\\n"
+            "class Model(nn.Module):\\n"
+            "    def forward(self, x):\\n"
+            "        return x\\n"
+        ),
+    )
+    plan = backend.plan_seed_mutation(
+        seed_task=seed_task,
+        target_category="conv",
+        zone="learning",
+        target_speedup_band=(1.3, 1.8),
+        solver_trace_summary="category=conv zone=learning speedup=1.4",
+        failure_exemplars=[],
+    )
+    assert plan.decision_mode == "learning"
+    assert plan.reason_code == "fallback"
+    assert plan.target_speedup_band == (1.3, 1.8)
 
 
 def test_tinker_teacher_backend_falls_back_on_invalid_category():
