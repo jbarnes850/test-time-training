@@ -47,6 +47,53 @@ BUDGET_TIER_CAPS = {
     "full": 500.0,
 }
 
+PHASE1_CLAIM_SCOPE = {
+    "phase": "phase1_inner_loop_only",
+    "world_model_enabled": False,
+    "in_scope_claim": "adaptive curriculum improves RLVR sample efficiency and cross-level transfer",
+    "out_of_scope_claim": "outer-loop world model learns transition dynamics / possibility frontier",
+}
+
+EXPERIMENT_ARM_POLICY = {
+    "custom": {
+        "arm_role": "custom",
+        "comparison_scope": "user_defined",
+        "primary_matched_compute": False,
+    },
+    "B0": {
+        "arm_role": "matched_compute_curriculum",
+        "comparison_scope": "compute_controlled",
+        "primary_matched_compute": True,
+        "description": "Adaptive curriculum from base model initialization (no RLVR sampler init).",
+    },
+    "B1": {
+        "arm_role": "matched_compute_baseline",
+        "comparison_scope": "compute_controlled",
+        "primary_matched_compute": True,
+        "description": "Random curriculum baseline.",
+    },
+    "B2": {
+        "arm_role": "matched_compute_baseline",
+        "comparison_scope": "compute_controlled",
+        "primary_matched_compute": True,
+        "description": "Static easy-to-hard curriculum baseline.",
+    },
+    "B3": {
+        "arm_role": "status_quo_anchor",
+        "comparison_scope": "anchor_only",
+        "primary_matched_compute": False,
+        "description": "Existing fixed-distribution RLVR checkpoint without additional training.",
+    },
+    "C": {
+        "arm_role": "matched_compute_treatment",
+        "comparison_scope": "compute_controlled",
+        "primary_matched_compute": True,
+        "description": "Adaptive curriculum treatment.",
+    },
+}
+
+PRIMARY_MATCHED_COMPUTE_ARMS = ("B0", "B1", "B2", "C")
+
 
 @dataclass
 class CostTracker:
@@ -390,11 +437,12 @@ def _prepare_task_handles(problem_ids: list[int], level: int) -> list[TaskHandle
     return handles
 
 
-def _build_mixed_train_handles(args: argparse.Namespace) -> list[TaskHandle]:
-    levels = _parse_int_csv(args.seed_levels)
-    weights = _parse_float_csv(args.seed_mix)
-    if len(levels) != len(weights):
-        raise ValueError("seed_levels and seed_mix must have the same length.")
+def _build_weighted_train_handles(
+    args: argparse.Namespace,
+    *,
+    levels: list[int],
+    weights: list[float],
+) -> list[TaskHandle]:
     available_levels = set(available_kernelbench_levels())
     requested_pairs = [(lvl, wt) for lvl, wt in zip(levels, weights) if lvl in available_levels]
     if not requested_pairs:
@@ -425,6 +473,22 @@ def _build_mixed_train_handles(args: argparse.Namespace) -> list[TaskHandle]:
         selected_ids = candidate_ids[:n_samples]
         train_handles.extend(_prepare_task_handles(selected_ids, level=level))
     return train_handles
+
+
+def _build_mixed_train_handles(args: argparse.Namespace) -> list[TaskHandle]:
+    levels = _parse_int_csv(args.seed_levels)
+    weights = _parse_float_csv(args.seed_mix)
+    if len(levels) != len(weights):
+        raise ValueError("seed_levels and seed_mix must have the same length.")
+    return _build_weighted_train_handles(args, levels=levels, weights=weights)
+
+
+def _build_uniform_train_handles(args: argparse.Namespace) -> list[TaskHandle]:
+    levels = _parse_int_csv(args.seed_levels)
+    if not levels:
+        raise ValueError("seed_levels must be non-empty for uniform level pool mode.")
+    weights = [1.0 for _ in levels]
+    return _build_weighted_train_handles(args, levels=levels, weights=weights)
 
 
 def _write_json(path: Path, payload: dict[str, Any]) -> None:
@@ -483,6 +547,31 @@ def _profile_solver(
                 }
             )
     return rows, total_wall
+
+
+def _gradient_signal_summary(
+    outcomes: list[SolveOutcome],
+    *,
+    std_threshold: float,
+) -> dict[str, float]:
+    if std_threshold < 0:
+        raise ValueError("std_threshold must be >= 0")
+    effective = 0
+    for outcome in outcomes:
+        if not outcome.rewards:
+            continue
+        reward_std = statistics.pstdev(outcome.rewards) if len(outcome.rewards) > 1 else 0.0
+        if reward_std > std_threshold:
+            effective += 1
+    total = len(outcomes)
+    zero_signal = max(0, total - effective)
+    return {
+        "effective_tasks": float(effective),
+        "zero_signal_tasks": float(zero_signal),
+        "effective_task_rate": (effective / total) if total > 0 else 0.0,
+        "std_threshold": float(std_threshold),
+        "task_count": float(total),
+    }
 
 
 def _select_seed_task(
@@ -556,8 +645,76 @@ def _load_solver_paths(args: argparse.Namespace) -> tuple[str, str]:
     return sampler_path, state_path
 
 
+def _normalize_arm_label(label: str) -> str:
+    arm = label.strip().upper()
+    if not arm:
+        return "custom"
+    if arm == "CUSTOM":
+        return "custom"
+    if arm in {"B0", "B1", "B2", "B3", "C"}:
+        return arm
+    raise ValueError(f"Unsupported experiment arm: {label}")
+
+
+def _set_arm_default(
+    args: argparse.Namespace,
+    field_name: str,
+    value: Any,
+    applied: dict[str, dict[str, Any]],
+) -> None:
+    current = getattr(args, field_name)
+    if current == value:
+        return
+    applied[field_name] = {"from": current, "to": value}
+    setattr(args, field_name, value)
+
+
+def _apply_experiment_arm_defaults(args: argparse.Namespace) -> tuple[str, dict[str, dict[str, Any]]]:
+    arm = _normalize_arm_label(args.experiment_arm)
+    applied: dict[str, dict[str, Any]] = {}
+    if arm == "custom":
+        return arm, applied
+
+    # Enforce baseline purity and explicit arm semantics.
+    if arm == "B1":
+        _set_arm_default(args, "teacher_strategy", "random", applied)
+        _set_arm_default(args, "curriculum_controller", "fixed", applied)
+        _set_arm_default(args, "seed_use_mixed_pool", True, applied)
+        _set_arm_default(args, "seed_pool_mode", "uniform_levels", applied)
+    elif arm == "B2":
+        _set_arm_default(args, "teacher_strategy", "easy_to_hard_static", applied)
+        _set_arm_default(args, "curriculum_controller", "fixed", applied)
+        _set_arm_default(args, "seed_use_mixed_pool", True, applied)
+        _set_arm_default(args, "seed_pool_mode", "uniform_levels", applied)
+    elif arm == "C":
+        _set_arm_default(args, "teacher_strategy", "frontier_band", applied)
+        _set_arm_default(args, "curriculum_controller", "adaptive", applied)
+        _set_arm_default(args, "seed_use_mixed_pool", True, applied)
+        _set_arm_default(args, "seed_pool_mode", "uniform_levels", applied)
+    elif arm == "B0":
+        _set_arm_default(args, "teacher_strategy", "frontier_band", applied)
+        _set_arm_default(args, "curriculum_controller", "adaptive", applied)
+        _set_arm_default(args, "seed_use_mixed_pool", True, applied)
+        _set_arm_default(args, "seed_pool_mode", "uniform_levels", applied)
+        # Force base-model initialization semantics.
+        _set_arm_default(args, "solver_sampler_path", "", applied)
+        _set_arm_default(args, "sampler_path", "", applied)
+        _set_arm_default(args, "checkpoint_jsonl", "", applied)
+    elif arm == "B3":
+        _set_arm_default(args, "curriculum_controller", "fixed", applied)
+        _set_arm_default(args, "enable_training", False, applied)
+        _set_arm_default(args, "tasks_per_epoch", 0, applied)
+    return arm, applied
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--experiment_arm",
+        type=str,
+        default="custom",
+        choices=["custom", "B0", "B1", "B2", "B3", "C"],
+    )
     parser.add_argument("--split_train", type=str, default="splits/l1_seed42.json")
     parser.add_argument("--split_eval", type=str, default="splits/l2_seed42.json")
     parser.add_argument("--train_subset", type=str, default="train")
@@ -565,6 +722,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--seed_use_mixed_pool", action="store_true")
     parser.add_argument("--seed_levels", type=str, default="1,2,3,4,5")
     parser.add_argument("--seed_mix", type=str, default="0.25,0.45,0.20,0.10,0.00")
+    parser.add_argument(
+        "--seed_pool_mode",
+        type=str,
+        default="configured_mix",
+        choices=["configured_mix", "uniform_levels"],
+    )
     parser.add_argument("--seed_split_paths", type=str, default="")
     parser.add_argument("--train_problem_ids", type=str, default="")
     parser.add_argument("--eval_problem_ids", type=str, default="")
@@ -630,6 +793,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--curriculum_too_hard_quota", type=float, default=0.25)
     parser.add_argument("--curriculum_target_learning_share", type=float, default=0.50)
     parser.add_argument("--curriculum_max_adjustment", type=float, default=0.15)
+    parser.add_argument(
+        "--curriculum_controller",
+        type=str,
+        default="adaptive",
+        choices=["adaptive", "fixed"],
+    )
     parser.add_argument("--replay_recency_window", type=int, default=200)
     parser.add_argument("--log_path", type=str, default="runs/adaptive_phase1")
     parser.add_argument("--resume_from", type=str, default="")
@@ -643,6 +812,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--train_api_usd_per_epoch", type=float, default=5.0)
     parser.add_argument("--teacher_api_usd_per_epoch", type=float, default=0.2)
     parser.add_argument("--eval_workers", type=int, default=1)
+    parser.add_argument("--effective_task_std_threshold", type=float, default=1e-5)
+    parser.add_argument("--min_effective_tasks", type=int, default=4)
+    parser.add_argument("--min_effective_tasks_patience", type=int, default=2)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--dry_run", action="store_true")
     return parser
@@ -650,14 +822,28 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
+    resolved_arm, applied_arm_defaults = _apply_experiment_arm_defaults(args)
+
     if args.eval_workers < 1:
         raise ValueError("--eval_workers must be >= 1")
+    if args.min_effective_tasks < 0:
+        raise ValueError("--min_effective_tasks must be >= 0")
+    if args.min_effective_tasks_patience < 1:
+        raise ValueError("--min_effective_tasks_patience must be >= 1")
+    if args.effective_task_std_threshold < 0:
+        raise ValueError("--effective_task_std_threshold must be >= 0")
     if not (0.0 <= args.learnability_low < args.learnability_high <= 1.0):
         raise ValueError("--learnability_low/--learnability_high must satisfy 0 <= low < high <= 1.")
     if not (0.0 <= args.curriculum_target_learning_share <= 1.0):
         raise ValueError("--curriculum_target_learning_share must be in [0, 1].")
     if not (0.0 <= args.curriculum_max_adjustment <= 1.0):
         raise ValueError("--curriculum_max_adjustment must be in [0, 1].")
+    if resolved_arm in {"B1", "B2"} and args.curriculum_controller != "fixed":
+        raise ValueError(f"{resolved_arm} must run with curriculum_controller=fixed for baseline purity.")
+    if resolved_arm in {"B1", "B2"} and args.seed_pool_mode != "uniform_levels":
+        raise ValueError(f"{resolved_arm} must run with seed_pool_mode=uniform_levels.")
+    if resolved_arm == "B3" and args.enable_training:
+        raise ValueError("B3 is a status-quo anchor and must disable training.")
 
     solver_backend_name = "dry_run" if args.dry_run else args.solver_backend
     teacher_backend_name = "heuristic" if args.dry_run else args.teacher_backend
@@ -702,7 +888,10 @@ def main(argv: list[str] | None = None) -> int:
     cost_tracker = _load_cost_tracker(cost_tracker_path, args.gpu_hour_rate)
 
     if args.seed_use_mixed_pool:
-        train_tasks = _build_mixed_train_handles(args)
+        if args.seed_pool_mode == "uniform_levels":
+            train_tasks = _build_uniform_train_handles(args)
+        else:
+            train_tasks = _build_mixed_train_handles(args)
     else:
         train_ids = _load_problem_ids(
             args.split_train,
@@ -719,7 +908,7 @@ def main(argv: list[str] | None = None) -> int:
         args.eval_problem_ids or None,
     )
     eval_tasks = _prepare_task_handles(eval_ids, level=args.level_eval)
-    if not train_tasks:
+    if not train_tasks and args.tasks_per_epoch > 0:
         raise RuntimeError("No training tasks resolved. Check seed level mix and split configuration.")
 
     sampler_path, training_state_path = _load_solver_paths(args)
@@ -759,6 +948,12 @@ def main(argv: list[str] | None = None) -> int:
             )
 
     run_config = dict(vars(args))
+    run_config["resolved_experiment_arm"] = resolved_arm
+    run_config["experiment_arm_policy"] = EXPERIMENT_ARM_POLICY[resolved_arm]
+    run_config["experiment_arm_defaults_applied"] = applied_arm_defaults
+    run_config["primary_matched_compute_arms"] = list(PRIMARY_MATCHED_COMPUTE_ARMS)
+    run_config["status_quo_anchor_arm"] = "B3"
+    run_config["phase1_claim_scope"] = PHASE1_CLAIM_SCOPE
     run_config["resolved_solver_backend"] = solver_backend_name
     run_config["resolved_solver_model_id"] = solver.model_id
     run_config["resolved_solver_sampler_path"] = solver.sampler_path
@@ -811,6 +1006,7 @@ def main(argv: list[str] | None = None) -> int:
     start_epoch = next_epoch
     prev_frontier_size: float | None = None
     prev_too_hard_size: float | None = None
+    low_signal_streak = 0
 
     for epoch in range(start_epoch, args.epochs):
         mutator_primary.reset_stats()
@@ -873,12 +1069,25 @@ def main(argv: list[str] | None = None) -> int:
             args.curriculum_too_hard_quota,
         )
         observed_zone_counts = _zone_counts_from_profiles(profiles)
-        adjusted_quotas, quota_adjustment = _adaptive_zone_quotas(
-            base_quotas,
-            observed_zone_counts,
-            target_learning_share=args.curriculum_target_learning_share,
-            max_adjustment=args.curriculum_max_adjustment,
-        )
+        if args.curriculum_controller == "adaptive":
+            adjusted_quotas, quota_adjustment = _adaptive_zone_quotas(
+                base_quotas,
+                observed_zone_counts,
+                target_learning_share=args.curriculum_target_learning_share,
+                max_adjustment=args.curriculum_max_adjustment,
+            )
+            quota_adjustment["controller"] = "adaptive"
+        else:
+            adjusted_quotas = dict(base_quotas)
+            total = sum(observed_zone_counts.values())
+            learning_share = (
+                observed_zone_counts.get(ZONE_LEARNING, 0.0) / total if total > 0 else 0.0
+            )
+            quota_adjustment = {
+                "controller": "fixed",
+                "learning_share": learning_share,
+                "delta_learning": 0.0,
+            }
         slot_count = min(args.tasks_per_epoch, len(ranked_train_tasks))
         desired_zone_counts = _allocate_zone_counts(slot_count, adjusted_quotas)
         zone_plan = _build_zone_plan(desired_zone_counts)
@@ -1139,6 +1348,20 @@ def main(argv: list[str] | None = None) -> int:
                 epoch=epoch,
             )
 
+        signal_stats = _gradient_signal_summary(
+            solve_outcomes,
+            std_threshold=args.effective_task_std_threshold,
+        )
+        effective_tasks = int(signal_stats["effective_tasks"])
+        zero_signal_tasks = int(signal_stats["zero_signal_tasks"])
+        required_effective_tasks = min(args.min_effective_tasks, len(solve_outcomes))
+        if effective_tasks < required_effective_tasks:
+            low_signal_streak += 1
+        else:
+            low_signal_streak = 0
+        signal_stats["required_effective_tasks"] = float(required_effective_tasks)
+        signal_stats["low_signal_streak"] = float(low_signal_streak)
+
         epoch_cost = cost_tracker.finalize_epoch(epoch, epoch_start_total)
         epoch_gpu_hours = max(0.0, cost_tracker.total_gpu_hours - epoch_start_gpu_hours)
         aggregate_fast_1 = (
@@ -1163,6 +1386,11 @@ def main(argv: list[str] | None = None) -> int:
             "fast_1_per_usd": (aggregate_fast_1 / epoch_cost) if epoch_cost > 0 else 0.0,
             "epoch_gpu_hours": epoch_gpu_hours,
             "epoch_cost_usd": epoch_cost,
+            "effective_tasks": effective_tasks,
+            "zero_signal_tasks": zero_signal_tasks,
+            "required_effective_tasks": required_effective_tasks,
+            "signal_task_rate": signal_stats["effective_task_rate"],
+            "low_signal_streak": low_signal_streak,
         }
         _append_jsonl(kpi_dashboard_path, kpi_payload)
         prev_frontier_size = frontier_size
@@ -1188,6 +1416,7 @@ def main(argv: list[str] | None = None) -> int:
             epoch_summary_path,
             {
                 "epoch": epoch,
+                "experiment_arm": resolved_arm,
                 "records_added": epoch_records,
                 "records_successful": successful_records,
                 "success_rate": (successful_records / epoch_records) if epoch_records else 0.0,
@@ -1195,7 +1424,9 @@ def main(argv: list[str] | None = None) -> int:
                 "running_total_usd": cost_tracker.total_usd,
                 "sampler_path": solver.sampler_path,
                 "teacher_decision": asdict(teacher_decision),
+                "phase1_claim_scope": PHASE1_CLAIM_SCOPE,
                 "curriculum": {
+                    "controller": args.curriculum_controller,
                     "base_quotas": base_quotas,
                     "adjusted_quotas": adjusted_quotas,
                     "observed_zone_counts": observed_zone_counts,
@@ -1207,6 +1438,14 @@ def main(argv: list[str] | None = None) -> int:
                         for zone, count in realized_zone_counts.items()
                     },
                 },
+                "gradient_signal": {
+                    "effective_tasks": effective_tasks,
+                    "zero_signal_tasks": zero_signal_tasks,
+                    "required_effective_tasks": required_effective_tasks,
+                    "effective_task_rate": signal_stats["effective_task_rate"],
+                    "std_threshold": args.effective_task_std_threshold,
+                    "low_signal_streak": low_signal_streak,
+                },
                 "kpi": kpi_payload,
                 "mutator_stats": {
                     "primary": mutator_primary.stats.as_dict(),
@@ -1214,6 +1453,25 @@ def main(argv: list[str] | None = None) -> int:
                 },
             },
         )
+
+        if (
+            required_effective_tasks > 0
+            and low_signal_streak >= args.min_effective_tasks_patience
+        ):
+            _append_jsonl(
+                epoch_summary_path,
+                {
+                    "epoch": epoch,
+                    "status": "halted_low_gradient_signal",
+                    "experiment_arm": resolved_arm,
+                    "effective_tasks": effective_tasks,
+                    "required_effective_tasks": required_effective_tasks,
+                    "zero_signal_tasks": zero_signal_tasks,
+                    "low_signal_streak": low_signal_streak,
+                    "min_effective_tasks_patience": args.min_effective_tasks_patience,
+                },
+            )
+            break
 
     return 0
 

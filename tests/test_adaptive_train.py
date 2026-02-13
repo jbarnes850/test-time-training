@@ -3,7 +3,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import scripts.adaptive_train as adaptive_train
-from src.env.schema import KernelTask
+from src.env.schema import KernelTask, MutatedTask
 
 
 def _write_split(path: Path) -> None:
@@ -98,9 +98,17 @@ def test_adaptive_train_dry_run_writes_required_artifacts(tmp_path: Path, monkey
     assert "mutation_instruction" in mutation_events[0]
 
     run_config = json.loads((run_dir / "run_config.json").read_text())
+    assert run_config["resolved_experiment_arm"] == "custom"
+    assert run_config["phase1_claim_scope"]["world_model_enabled"] is False
     assert run_config["resolved_solver_backend"] == "dry_run"
     assert run_config["resolved_solver_metadata"]["backend"] == "dry_run"
     assert run_config["resolved_mutator_backend"] == "dry_run"
+    assert run_config["experiment_arm_policy"]["comparison_scope"] == "user_defined"
+
+    assert "gradient_signal" in summary[0]
+    assert "effective_tasks" in summary[0]["gradient_signal"]
+    assert "zero_signal_tasks" in summary[0]["gradient_signal"]
+    assert "controller" in summary[0]["curriculum"]
 
 
 def test_adaptive_train_resume(tmp_path: Path, monkeypatch):
@@ -187,6 +195,160 @@ def test_allocate_level_counts_sums_to_total():
     counts = adaptive_train._allocate_level_counts(20, [0.25, 0.45, 0.2, 0.1])
     assert sum(counts) == 20
     assert counts == [5, 9, 4, 2]
+
+
+def test_apply_experiment_arm_defaults_b0_clears_sampler_init():
+    args = SimpleNamespace(
+        experiment_arm="B0",
+        teacher_strategy="inverse_correctness",
+        curriculum_controller="fixed",
+        seed_use_mixed_pool=False,
+        seed_pool_mode="configured_mix",
+        solver_sampler_path="tinker://old_sampler",
+        sampler_path="tinker://legacy_sampler",
+        checkpoint_jsonl="runs/checkpoints.jsonl",
+        enable_training=True,
+        tasks_per_epoch=20,
+    )
+    resolved, applied = adaptive_train._apply_experiment_arm_defaults(args)
+    assert resolved == "B0"
+    assert args.curriculum_controller == "adaptive"
+    assert args.seed_use_mixed_pool is True
+    assert args.seed_pool_mode == "uniform_levels"
+    assert args.solver_sampler_path == ""
+    assert args.sampler_path == ""
+    assert args.checkpoint_jsonl == ""
+    assert "solver_sampler_path" in applied
+
+
+def test_experiment_arm_b1_enforces_baseline_purity(tmp_path: Path, monkeypatch):
+    split_train = tmp_path / "split_train.json"
+    split_eval = tmp_path / "split_eval.json"
+    _write_split(split_train)
+    _write_split(split_eval)
+    monkeypatch.setattr(adaptive_train, "load_task", _fake_task)
+    monkeypatch.setattr(adaptive_train, "available_kernelbench_levels", lambda: (1, 2))
+    monkeypatch.setattr(
+        adaptive_train,
+        "load_kernelbench_level",
+        lambda level: [{"problem_id": i} for i in range(1, 11)],
+    )
+
+    run_dir = tmp_path / "run_b1"
+    rc = adaptive_train.main(
+        [
+            "--dry_run",
+            "--experiment_arm",
+            "B1",
+            "--split_train",
+            str(split_train),
+            "--split_eval",
+            str(split_eval),
+            "--epochs",
+            "1",
+            "--tasks_per_epoch",
+            "1",
+            "--k",
+            "2",
+            "--max_train_tasks",
+            "4",
+            "--max_eval_tasks",
+            "2",
+            "--log_path",
+            str(run_dir),
+        ]
+    )
+    assert rc == 0
+    run_config = json.loads((run_dir / "run_config.json").read_text())
+    assert run_config["resolved_experiment_arm"] == "B1"
+    assert run_config["teacher_strategy"] == "random"
+    assert run_config["curriculum_controller"] == "fixed"
+    assert run_config["seed_pool_mode"] == "uniform_levels"
+    assert run_config["experiment_arm_policy"]["arm_role"] == "matched_compute_baseline"
+
+    summary = [json.loads(line) for line in (run_dir / "epoch_summary.jsonl").read_text().splitlines()]
+    assert summary[0]["curriculum"]["controller"] == "fixed"
+
+
+def test_low_gradient_signal_gate_halts_run(tmp_path: Path, monkeypatch):
+    split_train = tmp_path / "split_train.json"
+    split_eval = tmp_path / "split_eval.json"
+    _write_split(split_train)
+    _write_split(split_eval)
+    monkeypatch.setattr(adaptive_train, "load_task", _fake_task)
+    counter = {"i": 0}
+
+    def _fake_mutate(
+        self,
+        seed_task,
+        *,
+        epoch,
+        seed_problem_id,
+        target_category,
+        level,
+        target_speedup_band,
+        solver_trace_summary,
+        mutation_instruction,
+        decision_mode,
+        reason_code,
+    ):
+        counter["i"] += 1
+        return MutatedTask(
+            task_id=f"mut_{epoch}_{counter['i']}",
+            parent_task_id=f"seed_{seed_problem_id}",
+            seed_problem_id=seed_problem_id,
+            name=f"mut_task_{seed_problem_id}",
+            reference_code=seed_task.reference_code + f"\n# mut {counter['i']}",
+            interface_signature_hash="sig",
+            category_tags=("activation",),
+            category_id=target_category or "activation",
+            mutation_backend="dry_run",
+            mutation_model_id="dry_run",
+            mutation_prompt_hash=f"prompt_{counter['i']}",
+            novelty_hash=f"novel_{counter['i']}",
+            epoch_created=epoch,
+            mutation_type="logic_restructuring",
+            optimization_prompt="focus memory access",
+            teacher_decision_mode=decision_mode,
+            teacher_reason_code=reason_code,
+            teacher_target_speedup_band=target_speedup_band,
+            teacher_mutation_instruction=mutation_instruction,
+            solver_trace_summary=solver_trace_summary,
+        )
+
+    monkeypatch.setattr(adaptive_train.KernelMutator, "mutate", _fake_mutate)
+
+    run_dir = tmp_path / "run_low_signal"
+    rc = adaptive_train.main(
+        [
+            "--dry_run",
+            "--split_train",
+            str(split_train),
+            "--split_eval",
+            str(split_eval),
+            "--epochs",
+            "3",
+            "--budget_tier",
+            "full",
+            "--tasks_per_epoch",
+            "1",
+            "--k",
+            "1",
+            "--min_effective_tasks",
+            "1",
+            "--min_effective_tasks_patience",
+            "1",
+            "--log_path",
+            str(run_dir),
+        ]
+    )
+    assert rc == 0
+    rows = [json.loads(line) for line in (run_dir / "epoch_summary.jsonl").read_text().splitlines()]
+    statuses = [row.get("status") for row in rows]
+    assert "halted_low_gradient_signal" in statuses
+    epoch_row = next(row for row in rows if row.get("epoch") == 0 and "gradient_signal" in row)
+    assert epoch_row["gradient_signal"]["effective_tasks"] == 0
+    assert epoch_row["gradient_signal"]["required_effective_tasks"] == 1
 
 
 def test_build_mixed_train_handles_uses_available_levels(monkeypatch):
