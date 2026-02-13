@@ -815,6 +815,64 @@ def _select_seed_task(
     )
 
 
+def _bootstrap_mode_active(profiles_by_zone: dict[str, list[CapabilityProfile]]) -> bool:
+    learning = profiles_by_zone.get(ZONE_LEARNING, [])
+    mastered = profiles_by_zone.get(ZONE_MASTERED, [])
+    return not learning and not mastered
+
+
+def _select_bootstrap_seed_task(
+    *,
+    replay_buffer: ReplayBuffer,
+    ranked_train_tasks: list[TaskHandle],
+    replay_recency_window: int,
+) -> tuple[KernelTask, str, int, str, int, str]:
+    replay_seed = replay_buffer.select_seed(
+        {
+            "correct_only": True,
+            "min_speedup": 1.0,
+            "recency_window": replay_recency_window,
+        }
+    )
+    if replay_seed and replay_seed.problem_id is not None:
+        seed_task = KernelTask(
+            problem_id=int(replay_seed.problem_id),
+            name=f"replay_seed_{replay_seed.task_id}",
+            reference_code=replay_seed.task_reference_code,
+        )
+        replay_level = int(replay_seed.level) if replay_seed.level is not None else 1
+        return (
+            seed_task,
+            replay_seed.task_id,
+            int(replay_seed.problem_id),
+            replay_seed.category_id,
+            replay_level,
+            "replay_positive",
+        )
+
+    if not ranked_train_tasks:
+        raise RuntimeError("No training tasks available for bootstrap seed selection.")
+
+    l1_candidates = sorted(
+        (h for h in ranked_train_tasks if int(h.level) == 1),
+        key=lambda h: h.task.problem_id,
+    )
+    if l1_candidates:
+        anchor = l1_candidates[0]
+        source = "l1_anchor"
+    else:
+        anchor = sorted(ranked_train_tasks, key=lambda h: h.task.problem_id)[0]
+        source = "train_anchor"
+    return (
+        anchor.task,
+        f"seed_{anchor.task.problem_id}",
+        anchor.task.problem_id,
+        anchor.category_id,
+        anchor.level,
+        source,
+    )
+
+
 def _budget_cap(args: argparse.Namespace) -> float:
     if args.budget_cap_usd is not None:
         return float(args.budget_cap_usd)
@@ -1392,6 +1450,14 @@ def main(argv: list[str] | None = None) -> int:
             zone_plan.extend([ZONE_LEARNING] * (slot_count - len(zone_plan)))
         zone_plan = zone_plan[:slot_count]
         realized_zone_counts = {ZONE_MASTERED: 0, ZONE_LEARNING: 0, ZONE_TOO_HARD: 0}
+        bootstrap_mode = _bootstrap_mode_active(profiles_by_zone)
+        bootstrap_mode_entered = bootstrap_mode
+        bootstrap_count = 0
+        bootstrap_seed_source_counts: dict[str, int] = {
+            "replay_positive": 0,
+            "l1_anchor": 0,
+            "train_anchor": 0,
+        }
 
         solve_outcomes: list[SolveOutcome] = []
         slot_idx = 0
@@ -1411,41 +1477,67 @@ def main(argv: list[str] | None = None) -> int:
                 slot_zone,
                 teacher_decision.target_category,
             )
-            if slot_profile is None:
-                _append_jsonl(
-                    mutation_events_path,
-                    {
-                        "epoch": epoch,
-                        "status": "no_eligible_seed_zone",
-                        "requested_zone": slot_zone,
-                    },
+            bootstrap_seed_source = ""
+            if bootstrap_mode:
+                effective_zone = ZONE_LEARNING
+                preferred_category = (
+                    slot_profile.category_id
+                    if slot_profile is not None
+                    else teacher_decision.target_category
                 )
-                continue
-            effective_zone = (
-                slot_profile.zone
-                if slot_profile.zone in {ZONE_MASTERED, ZONE_LEARNING}
-                else slot_zone
-            )
-            if effective_zone not in {ZONE_MASTERED, ZONE_LEARNING}:
-                _append_jsonl(
-                    mutation_events_path,
-                    {
-                        "epoch": epoch,
-                        "status": "skip_too_hard_zone",
-                        "requested_zone": slot_zone,
-                        "zone": effective_zone,
-                        "category_id": slot_profile.category_id,
-                    },
+                decision_mode = "learning"
+                reason_code = "bootstrap"
+                target_speedup_band = _zone_target_speedup_band(ZONE_LEARNING)
+                mutation_instruction = (
+                    "Bootstrap from a solvable anchor while preserving interface and "
+                    "adding one compositional change."
                 )
-                continue
-            preferred_category = (
-                slot_profile.category_id if slot_profile is not None else teacher_decision.target_category
-            )
-            decision_mode = _zone_decision_mode(effective_zone)
-            reason_code = _zone_reason_code(effective_zone)
-            target_speedup_band = _zone_target_speedup_band(effective_zone)
-            mutation_instruction = "Generate a valid interface-preserving mutation."
-            if slot_profile is not None:
+                seed_task, parent_task_id, seed_problem_id, seed_category, seed_level, bootstrap_seed_source = (
+                    _select_bootstrap_seed_task(
+                        replay_buffer=replay_buffer,
+                        ranked_train_tasks=ranked_train_tasks,
+                        replay_recency_window=args.replay_recency_window,
+                    )
+                )
+                bootstrap_count += 1
+                bootstrap_seed_source_counts[bootstrap_seed_source] = (
+                    bootstrap_seed_source_counts.get(bootstrap_seed_source, 0) + 1
+                )
+            else:
+                if slot_profile is None:
+                    _append_jsonl(
+                        mutation_events_path,
+                        {
+                            "epoch": epoch,
+                            "status": "no_eligible_seed_zone",
+                            "requested_zone": slot_zone,
+                            "bootstrap_mode": False,
+                        },
+                    )
+                    continue
+                effective_zone = (
+                    slot_profile.zone
+                    if slot_profile.zone in {ZONE_MASTERED, ZONE_LEARNING}
+                    else slot_zone
+                )
+                if effective_zone not in {ZONE_MASTERED, ZONE_LEARNING}:
+                    _append_jsonl(
+                        mutation_events_path,
+                        {
+                            "epoch": epoch,
+                            "status": "skip_too_hard_zone",
+                            "requested_zone": slot_zone,
+                            "zone": effective_zone,
+                            "category_id": slot_profile.category_id,
+                            "bootstrap_mode": False,
+                        },
+                    )
+                    continue
+                preferred_category = slot_profile.category_id
+                decision_mode = _zone_decision_mode(effective_zone)
+                reason_code = _zone_reason_code(effective_zone)
+                target_speedup_band = _zone_target_speedup_band(effective_zone)
+                mutation_instruction = "Generate a valid interface-preserving mutation."
                 mutation_instruction = (
                     teacher_decision.mutation_instruction
                     if (
@@ -1459,24 +1551,24 @@ def main(argv: list[str] | None = None) -> int:
                         else "Generate a structurally harder but learnable mutation."
                     )
                 )
-            if (
-                effective_zone == ZONE_LEARNING
-                and preferred_category == teacher_decision.target_category
-                and teacher_decision.decision_mode
-            ):
-                decision_mode = teacher_decision.decision_mode
-                reason_code = teacher_decision.reason_code or reason_code
-                target_speedup_band = teacher_decision.target_speedup_band or target_speedup_band
-                if teacher_decision.mutation_instruction:
-                    mutation_instruction = teacher_decision.mutation_instruction
+                if (
+                    effective_zone == ZONE_LEARNING
+                    and preferred_category == teacher_decision.target_category
+                    and teacher_decision.decision_mode
+                ):
+                    decision_mode = teacher_decision.decision_mode
+                    reason_code = teacher_decision.reason_code or reason_code
+                    target_speedup_band = teacher_decision.target_speedup_band or target_speedup_band
+                    if teacher_decision.mutation_instruction:
+                        mutation_instruction = teacher_decision.mutation_instruction
 
-            seed_task, parent_task_id, seed_problem_id, seed_category, seed_level = _select_seed_task(
-                replay_buffer=replay_buffer,
-                ranked_train_tasks=ranked_train_tasks,
-                profiles=profiles,
-                replay_recency_window=args.replay_recency_window,
-                preferred_category=preferred_category,
-            )
+                seed_task, parent_task_id, seed_problem_id, seed_category, seed_level = _select_seed_task(
+                    replay_buffer=replay_buffer,
+                    ranked_train_tasks=ranked_train_tasks,
+                    profiles=profiles,
+                    replay_recency_window=args.replay_recency_window,
+                    preferred_category=preferred_category,
+                )
             preferred_profile = teacher.latest_profile().get(seed_category)
             solver_trace_summary = (
                 f"category={seed_category} zone={preferred_profile.zone} "
@@ -1601,6 +1693,8 @@ def main(argv: list[str] | None = None) -> int:
                             str(row.get("entry_id", "")) for row in seed_failure_exemplars
                         ],
                         "failure_exemplar_count": len(seed_failure_exemplars),
+                        "bootstrap_mode": bootstrap_mode,
+                        "bootstrap_seed_source": bootstrap_seed_source,
                     },
                 )
                 bank_eval = EvalResult(
@@ -1653,6 +1747,8 @@ def main(argv: list[str] | None = None) -> int:
                     "mutation_type": mutated.mutation_type,
                     "mutation_backend": mutated.mutation_backend,
                     "mutation_model_id": mutated.mutation_model_id,
+                    "bootstrap_mode": bootstrap_mode,
+                    "bootstrap_seed_source": bootstrap_seed_source,
                 },
             )
 
@@ -1699,6 +1795,8 @@ def main(argv: list[str] | None = None) -> int:
                             "admission_total_count": int(admission_result["total_count"]),
                             "admission_success_rate": float(admission_result["success_rate"]),
                             "admission_speedup_threshold": float(args.admission_speedup_threshold),
+                            "bootstrap_mode": bootstrap_mode,
+                            "bootstrap_seed_source": bootstrap_seed_source,
                         },
                     )
                     bank_eval = EvalResult(
@@ -1836,6 +1934,8 @@ def main(argv: list[str] | None = None) -> int:
                         strategy=args.teacher_strategy,
                     )
                     profiles_by_zone = teacher.profiles_by_zone()
+                    if bootstrap_mode and not _bootstrap_mode_active(profiles_by_zone):
+                        bootstrap_mode = False
                     observed_zone_counts = _zone_counts_from_profiles(profiles)
                     if args.curriculum_controller == "adaptive":
                         adjusted_quotas, quota_adjustment = _adaptive_zone_quotas(
@@ -1936,6 +2036,10 @@ def main(argv: list[str] | None = None) -> int:
             "estimated_solver_compute_saved_samples": (
                 solver_rollouts_skipped_by_admission * max(0, int(args.k))
             ),
+            "bootstrap_mode_entered": bootstrap_mode_entered,
+            "bootstrap_mode_active_end": bootstrap_mode,
+            "bootstrap_count": bootstrap_count,
+            "bootstrap_seed_source_counts": dict(bootstrap_seed_source_counts),
         }
         _append_jsonl(kpi_dashboard_path, kpi_payload)
         prev_frontier_size = frontier_size
@@ -1993,6 +2097,10 @@ def main(argv: list[str] | None = None) -> int:
                         if admission_attempted_tasks > 0
                         else 0.0
                     ),
+                    "bootstrap_mode_entered": bootstrap_mode_entered,
+                    "bootstrap_mode_active_end": bootstrap_mode,
+                    "bootstrap_count": bootstrap_count,
+                    "bootstrap_seed_source_counts": dict(bootstrap_seed_source_counts),
                 },
                 "gradient_signal": {
                     "effective_tasks": effective_tasks,

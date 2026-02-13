@@ -3,7 +3,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import scripts.adaptive_train as adaptive_train
-from src.env.schema import KernelTask, MutatedTask
+from src.env.schema import EvalResult, KernelTask, MutatedTask, ReplayEntry
 
 
 def _write_split(path: Path) -> None:
@@ -516,6 +516,198 @@ def test_build_mixed_train_handles_uses_available_levels(monkeypatch):
     assert len(handles) == 10
     levels = {h.level for h in handles}
     assert levels == {1, 2}
+
+
+def test_select_bootstrap_seed_task_prefers_replay_positive(tmp_path: Path):
+    replay = adaptive_train.ReplayBuffer(tmp_path / "replay.jsonl")
+    replay.append(
+        ReplayEntry(
+            entry_id="seed1",
+            task_id="task_seed_1",
+            parent_task_id=None,
+            problem_id=77,
+            level=2,
+            category_id="composite:matmul+activation",
+            task_reference_code=_fake_task(77).reference_code,
+            kernel_code="return x",
+            eval_result=EvalResult(
+                compiled=True,
+                correctness=True,
+                runtime_us=1.0,
+                ref_runtime_us=1.5,
+                speedup=1.5,
+                metadata={},
+            ),
+            reward=1.5,
+            sampler_path="sampler://seed",
+            backend="tinker",
+            timestamp=1.0,
+            epoch=0,
+            is_mutated=True,
+        )
+    )
+    handles = [
+        adaptive_train.TaskHandle(
+            task=_fake_task(1),
+            level=1,
+            category_tags=("unknown",),
+            category_id="unknown",
+        )
+    ]
+    seed_task, _, seed_problem_id, seed_category, seed_level, source = (
+        adaptive_train._select_bootstrap_seed_task(
+            replay_buffer=replay,
+            ranked_train_tasks=handles,
+            replay_recency_window=200,
+        )
+    )
+    assert source == "replay_positive"
+    assert seed_problem_id == 77
+    assert seed_category == "composite:matmul+activation"
+    assert seed_level == 2
+    assert seed_task.problem_id == 77
+
+
+def test_select_bootstrap_seed_task_falls_back_to_l1_anchor(tmp_path: Path):
+    replay = adaptive_train.ReplayBuffer(tmp_path / "replay.jsonl")
+    handles = [
+        adaptive_train.TaskHandle(
+            task=_fake_task(5),
+            level=2,
+            category_tags=("unknown",),
+            category_id="unknown",
+        ),
+        adaptive_train.TaskHandle(
+            task=_fake_task(2),
+            level=1,
+            category_tags=("unknown",),
+            category_id="unknown",
+        ),
+    ]
+    seed_task, _, seed_problem_id, _, seed_level, source = adaptive_train._select_bootstrap_seed_task(
+        replay_buffer=replay,
+        ranked_train_tasks=handles,
+        replay_recency_window=200,
+    )
+    assert source == "l1_anchor"
+    assert seed_level == 1
+    assert seed_problem_id == 2
+    assert seed_task.problem_id == 2
+
+
+def test_bootstrap_mode_routes_through_mutate_solve_replay(tmp_path: Path, monkeypatch):
+    split_train = tmp_path / "split_train.json"
+    split_eval = tmp_path / "split_eval.json"
+    _write_split(split_train)
+    _write_split(split_eval)
+    monkeypatch.setattr(adaptive_train, "load_task", _fake_task)
+
+    def _profile_all_too_hard(
+        solver,
+        eval_tasks,
+        *,
+        profile_k,
+        temperature,
+        max_tokens,
+        eval_workers,
+    ):
+        rows = []
+        for handle in eval_tasks:
+            rows.append(
+                {
+                    "task_id": f"{handle.task.problem_id}",
+                    "sample_idx": 0,
+                    "category_id": handle.category_id,
+                    "correctness": True,
+                    "speedup": 1.01,
+                    "runtime_us": 1000.0,
+                    "fast_1": 1.0,
+                }
+            )
+        return rows, 0.01
+
+    counter = {"i": 0}
+
+    def _fake_mutate(
+        self,
+        seed_task,
+        *,
+        epoch,
+        seed_problem_id,
+        target_category,
+        level,
+        target_speedup_band,
+        failure_exemplars,
+        solver_trace_summary,
+        mutation_instruction,
+        decision_mode,
+        reason_code,
+        teacher_seed_rationale,
+    ):
+        counter["i"] += 1
+        return MutatedTask(
+            task_id=f"mut_{epoch}_{counter['i']}",
+            parent_task_id=f"seed_{seed_problem_id}",
+            seed_problem_id=seed_problem_id,
+            name=f"mut_task_{seed_problem_id}",
+            reference_code=seed_task.reference_code + f"\n# mut {counter['i']}",
+            interface_signature_hash="sig",
+            category_tags=("activation",),
+            category_id=target_category or "activation",
+            mutation_backend="dry_run",
+            mutation_model_id="dry_run",
+            mutation_prompt_hash=f"prompt_{counter['i']}",
+            novelty_hash=f"novel_{counter['i']}",
+            epoch_created=epoch,
+            mutation_type="logic_restructuring",
+            optimization_prompt="focus memory access",
+            teacher_decision_mode=decision_mode,
+            teacher_reason_code=reason_code,
+            teacher_target_speedup_band=target_speedup_band,
+            teacher_mutation_instruction=mutation_instruction,
+            solver_trace_summary=solver_trace_summary,
+            teacher_failure_entry_ids=tuple(
+                str(row.get("entry_id", "")) for row in (failure_exemplars or [])
+            ),
+            teacher_seed_rationale=teacher_seed_rationale or "",
+        )
+
+    monkeypatch.setattr(adaptive_train, "_profile_solver", _profile_all_too_hard)
+    monkeypatch.setattr(adaptive_train.KernelMutator, "mutate", _fake_mutate)
+
+    run_dir = tmp_path / "run_bootstrap"
+    rc = adaptive_train.main(
+        [
+            "--dry_run",
+            "--no-enable_admission_gate",
+            "--split_train",
+            str(split_train),
+            "--split_eval",
+            str(split_eval),
+            "--epochs",
+            "1",
+            "--tasks_per_epoch",
+            "1",
+            "--k",
+            "1",
+            "--mini_reprofile_every",
+            "0",
+            "--budget_tier",
+            "full",
+            "--log_path",
+            str(run_dir),
+        ]
+    )
+    assert rc == 0
+    summary = [json.loads(line) for line in (run_dir / "epoch_summary.jsonl").read_text().splitlines()]
+    assert summary
+    assert summary[0]["records_added"] > 0
+    assert summary[0]["curriculum"]["bootstrap_mode_entered"] is True
+    assert summary[0]["curriculum"]["bootstrap_count"] >= 1
+    assert summary[0]["curriculum"]["bootstrap_seed_source_counts"]["l1_anchor"] >= 1
+    events = [json.loads(line) for line in (run_dir / "mutation_events.jsonl").read_text().splitlines()]
+    assert any(row.get("status") == "mutated" for row in events)
+    assert any(row.get("bootstrap_mode") is True for row in events)
 
 
 def test_admission_gate_rejection_logs_and_skips_solver(tmp_path: Path, monkeypatch):
