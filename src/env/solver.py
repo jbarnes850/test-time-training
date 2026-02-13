@@ -18,7 +18,7 @@ from src.utils.tinker_utils import ensure_tinker_cookbook_on_path
 class SolverBackendConfig:
     backend: str
     model_id: str
-    sampler_path: str
+    sampler_path: str = ""
     renderer_name: str = "gpt_oss_no_sysprompt"
     training_enabled: bool = False
     training_state_path: str = ""
@@ -142,8 +142,6 @@ class TinkerSolverBackend:
         from tinker_cookbook.renderers import get_renderer, get_text_content
         from tinker_cookbook.tokenizer_utils import get_tokenizer
 
-        if not config.sampler_path:
-            raise ValueError("Solver sampler path must be provided for Tinker backend.")
         if config.training_enabled and not config.training_state_path:
             raise ValueError(
                 "Training requires a Tinker training state path. "
@@ -155,15 +153,25 @@ class TinkerSolverBackend:
         self.backend_name = "tinker"
         self.provider_name = "tinker"
         self.model_id = config.model_id
-        self.sampler_path = config.sampler_path
+        self.sampler_path = config.sampler_path or config.model_id
         self.renderer_name = config.renderer_name
         self.training_enabled = config.training_enabled
         self.training_state_path = config.training_state_path
         self.learning_rate = config.learning_rate
         self.lora_rank = config.lora_rank
+        self._init_mode = "sampler_path" if config.sampler_path else "base_model"
 
         self._service_client = tinker.ServiceClient()
-        self._sampling_client = self._service_client.create_sampling_client(model_path=self.sampler_path)
+        if config.sampler_path:
+            self._resolved_model_path = config.sampler_path
+            self._sampling_client = self._service_client.create_sampling_client(
+                model_path=config.sampler_path
+            )
+        else:
+            self._resolved_model_path = f"base_model:{config.model_id}"
+            self._sampling_client = self._service_client.create_sampling_client(
+                base_model=config.model_id
+            )
         tokenizer = get_tokenizer(self.model_id)
         self._renderer = get_renderer(self.renderer_name, tokenizer)
         self._training_client = None
@@ -268,7 +276,11 @@ class TinkerSolverBackend:
         self.sampler_path = self._training_client.save_weights_for_sampler(
             name=f"adaptive_epoch_{epoch}"
         ).result().path
-        self._sampling_client = self._service_client.create_sampling_client(model_path=self.sampler_path)
+        self._resolved_model_path = self.sampler_path
+        self._sampling_client = self._service_client.create_sampling_client(
+            model_path=self.sampler_path
+        )
+        self._init_mode = "sampler_path"
         return self.sampler_path
 
     def metadata(self) -> dict[str, Any]:
@@ -277,6 +289,8 @@ class TinkerSolverBackend:
             "provider": self.provider_name,
             "model_id": self.model_id,
             "sampler_path": self.sampler_path,
+            "resolved_model_path": self._resolved_model_path,
+            "init_mode": self._init_mode,
             "training_enabled": self.training_enabled,
             "training_state_path": self.training_state_path,
             "renderer_name": self.renderer_name,
