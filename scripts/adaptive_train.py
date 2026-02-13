@@ -310,14 +310,15 @@ def _allocate_level_counts(total: int, weights: list[float]) -> list[int]:
 
 
 def _normalize_zone_quotas(mastered: float, learning: float, too_hard: float) -> dict[str, float]:
+    _ = too_hard
     quotas = {
         ZONE_MASTERED: max(0.0, float(mastered)),
         ZONE_LEARNING: max(0.0, float(learning)),
-        ZONE_TOO_HARD: max(0.0, float(too_hard)),
+        ZONE_TOO_HARD: 0.0,
     }
     total = sum(quotas.values())
     if total <= 0:
-        return {ZONE_MASTERED: 0.15, ZONE_LEARNING: 0.60, ZONE_TOO_HARD: 0.25}
+        return {ZONE_MASTERED: 0.20, ZONE_LEARNING: 0.80, ZONE_TOO_HARD: 0.0}
     return {zone: value / total for zone, value in quotas.items()}
 
 
@@ -366,10 +367,12 @@ def _adaptive_zone_quotas(
 
 
 def _allocate_zone_counts(total_slots: int, quotas: dict[str, float]) -> dict[str, int]:
-    zones = [ZONE_MASTERED, ZONE_LEARNING, ZONE_TOO_HARD]
+    zones = [ZONE_MASTERED, ZONE_LEARNING]
     weights = [quotas.get(zone, 0.0) for zone in zones]
     counts = _allocate_level_counts(total_slots, weights)
-    return {zone: count for zone, count in zip(zones, counts)}
+    out = {zone: count for zone, count in zip(zones, counts)}
+    out[ZONE_TOO_HARD] = 0
+    return out
 
 
 def _build_zone_plan(zone_counts: dict[str, int]) -> list[str]:
@@ -387,7 +390,7 @@ def _pick_category_for_zone(
     candidates = profiles_by_zone.get(zone, [])
     if candidates:
         return candidates[0]
-    for alt in (ZONE_LEARNING, ZONE_TOO_HARD, ZONE_MASTERED):
+    for alt in (ZONE_LEARNING, ZONE_MASTERED):
         alt_candidates = profiles_by_zone.get(alt, [])
         if alt_candidates:
             return alt_candidates[0]
@@ -550,6 +553,56 @@ def _profile_solver(
                 }
             )
     return rows, total_wall
+
+
+def _is_success_result(result: EvalResult, *, speedup_threshold: float) -> bool:
+    return bool(result.correctness) and float(result.speedup) > float(speedup_threshold)
+
+
+def _count_successes_from_eval_results(
+    eval_results: list[EvalResult],
+    *,
+    speedup_threshold: float,
+) -> tuple[int, int, float]:
+    total = len(eval_results)
+    success_count = sum(
+        1 for result in eval_results if _is_success_result(result, speedup_threshold=speedup_threshold)
+    )
+    success_rate = (success_count / total) if total > 0 else 0.0
+    return success_count, total, success_rate
+
+
+def _run_admission_gate(
+    verifier: SolverBackend,
+    task: KernelTask,
+    *,
+    k: int,
+    temperature: float,
+    max_tokens: int,
+    level: int,
+    eval_workers: int,
+    speedup_threshold: float,
+) -> dict[str, Any]:
+    outcome = verifier.solve_task(
+        task,
+        k=k,
+        temperature=temperature,
+        max_tokens=max_tokens,
+        level=level,
+        eval_workers=eval_workers,
+    )
+    success_count, total_count, success_rate = _count_successes_from_eval_results(
+        outcome.eval_results,
+        speedup_threshold=speedup_threshold,
+    )
+    return {
+        "admitted": success_count > 0,
+        "success_count": success_count,
+        "total_count": total_count,
+        "success_rate": success_rate,
+        "wall_clock_s": float(outcome.wall_clock_s),
+        "eval_results": outcome.eval_results,
+    }
 
 
 def _zone_failure_speedup_ceiling(zone: str) -> float:
@@ -943,7 +996,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--learnability_high", type=float, default=0.75)
     parser.add_argument("--curriculum_mastered_quota", type=float, default=0.15)
     parser.add_argument("--curriculum_learning_quota", type=float, default=0.60)
-    parser.add_argument("--curriculum_too_hard_quota", type=float, default=0.25)
+    parser.add_argument("--curriculum_too_hard_quota", type=float, default=0.0)
     parser.add_argument("--curriculum_target_learning_share", type=float, default=0.50)
     parser.add_argument("--curriculum_max_adjustment", type=float, default=0.15)
     parser.add_argument(
@@ -962,6 +1015,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--profile_api_usd_per_epoch", type=float, default=2.0)
     parser.add_argument("--mini_profile_api_usd_per_probe", type=float, default=0.5)
     parser.add_argument("--mutate_api_usd_per_task", type=float, default=0.15)
+    parser.add_argument("--admission_api_usd_per_task", type=float, default=0.08)
     parser.add_argument("--solve_api_usd_per_task", type=float, default=0.5)
     parser.add_argument("--train_api_usd_per_epoch", type=float, default=5.0)
     parser.add_argument("--teacher_api_usd_per_epoch", type=float, default=0.2)
@@ -973,6 +1027,22 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--effective_task_std_threshold", type=float, default=1e-5)
     parser.add_argument("--min_effective_tasks", type=int, default=4)
     parser.add_argument("--min_effective_tasks_patience", type=int, default=2)
+    parser.add_argument("--enable_admission_gate", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--admission_k", type=int, default=8)
+    parser.add_argument("--admission_speedup_threshold", type=float, default=1.5)
+    parser.add_argument(
+        "--verifier_backend",
+        type=str,
+        default="",
+        choices=["", "tinker", "dry_run"],
+    )
+    parser.add_argument(
+        "--verifier_model_id",
+        type=str,
+        default="Qwen/Qwen3-235B-A22B-Instruct-2507",
+    )
+    parser.add_argument("--verifier_sampler_path", type=str, default="")
+    parser.add_argument("--verifier_renderer_name", type=str, default="")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--dry_run", action="store_true")
     return parser
@@ -1000,6 +1070,10 @@ def main(argv: list[str] | None = None) -> int:
         raise ValueError("--min_effective_tasks_patience must be >= 1")
     if args.effective_task_std_threshold < 0:
         raise ValueError("--effective_task_std_threshold must be >= 0")
+    if args.admission_k < 1:
+        raise ValueError("--admission_k must be >= 1")
+    if args.admission_speedup_threshold <= 0:
+        raise ValueError("--admission_speedup_threshold must be > 0")
     if not (0.0 <= args.learnability_low < args.learnability_high <= 1.0):
         raise ValueError("--learnability_low/--learnability_high must satisfy 0 <= low < high <= 1.")
     if not (0.0 <= args.curriculum_target_learning_share <= 1.0):
@@ -1022,10 +1096,16 @@ def main(argv: list[str] | None = None) -> int:
 
     solver_backend_name = "dry_run" if args.dry_run else args.solver_backend
     teacher_backend_name = "heuristic" if args.dry_run else args.teacher_backend
+    verifier_backend_name = (
+        "dry_run"
+        if args.dry_run
+        else (args.verifier_backend or solver_backend_name)
+    )
     needs_tinker_api = (
         solver_backend_name == "tinker"
         or (not args.dry_run and args.mutator_backend == "tinker")
         or teacher_backend_name == "tinker"
+        or (args.enable_admission_gate and verifier_backend_name == "tinker")
     )
     if needs_tinker_api and not os.environ.get("TINKER_API_KEY"):
         raise RuntimeError("TINKER_API_KEY not set.")
@@ -1122,6 +1202,26 @@ def main(argv: list[str] | None = None) -> int:
                 model_id=args.mutator_frontier_model_path or args.mutator_model_path
             )
 
+    verifier: SolverBackend | None = None
+    if args.enable_admission_gate:
+        resolved_verifier_backend = verifier_backend_name
+        verifier_model_id = args.verifier_model_id or solver_model_id
+        verifier_renderer_name = args.verifier_renderer_name or solver_renderer_name
+        if resolved_verifier_backend == "dry_run":
+            verifier = DryRunSolverBackend("dry_run/verifier")
+        else:
+            verifier_config = SolverBackendConfig(
+                backend=resolved_verifier_backend,
+                model_id=verifier_model_id,
+                sampler_path=args.verifier_sampler_path,
+                renderer_name=verifier_renderer_name,
+                training_enabled=False,
+                training_state_path="",
+                lora_rank=args.lora_rank,
+                learning_rate=args.learning_rate,
+            )
+            verifier = TinkerSolverBackend(config=verifier_config)
+
     run_config = dict(vars(args))
     run_config["resolved_experiment_arm"] = resolved_arm
     run_config["experiment_arm_policy"] = EXPERIMENT_ARM_POLICY[resolved_arm]
@@ -1135,6 +1235,18 @@ def main(argv: list[str] | None = None) -> int:
     run_config["resolved_solver_metadata"] = solver.metadata()
     run_config["resolved_teacher_backend"] = teacher_backend.backend_name
     run_config["resolved_teacher_model_id"] = teacher_backend.model_id
+    run_config["admission_gate_enabled"] = bool(args.enable_admission_gate)
+    run_config["admission_k"] = int(args.admission_k)
+    run_config["admission_speedup_threshold"] = float(args.admission_speedup_threshold)
+    run_config["resolved_verifier_backend"] = (
+        verifier.backend_name if verifier is not None else "disabled"
+    )
+    run_config["resolved_verifier_model_id"] = (
+        verifier.model_id if verifier is not None else ""
+    )
+    run_config["resolved_verifier_metadata"] = (
+        verifier.metadata() if verifier is not None else {}
+    )
     run_config["resolved_mutator_backend"] = mutator_backend_primary.backend_name
     run_config["resolved_mutator_model_id"] = mutator_backend_primary.model_id
     run_config["resolved_mutator_frontier_model_id"] = mutator_backend_frontier.model_id
@@ -1284,6 +1396,12 @@ def main(argv: list[str] | None = None) -> int:
         solve_outcomes: list[SolveOutcome] = []
         slot_idx = 0
         mini_reprofile_events = 0
+        admission_attempted_tasks = 0
+        admission_admitted_tasks = 0
+        admission_rejected_tasks = 0
+        admission_success_rate_sum = 0.0
+        admission_gpu_hours = 0.0
+        solver_rollouts_skipped_by_admission = 0
 
         while slot_idx < slot_count:
             slot_zone = zone_plan[slot_idx] if slot_idx < len(zone_plan) else ZONE_LEARNING
@@ -1293,20 +1411,40 @@ def main(argv: list[str] | None = None) -> int:
                 slot_zone,
                 teacher_decision.target_category,
             )
+            if slot_profile is None:
+                _append_jsonl(
+                    mutation_events_path,
+                    {
+                        "epoch": epoch,
+                        "status": "no_eligible_seed_zone",
+                        "requested_zone": slot_zone,
+                    },
+                )
+                continue
             effective_zone = (
                 slot_profile.zone
-                if slot_profile is not None and slot_profile.zone in {ZONE_MASTERED, ZONE_LEARNING, ZONE_TOO_HARD}
+                if slot_profile.zone in {ZONE_MASTERED, ZONE_LEARNING}
                 else slot_zone
             )
+            if effective_zone not in {ZONE_MASTERED, ZONE_LEARNING}:
+                _append_jsonl(
+                    mutation_events_path,
+                    {
+                        "epoch": epoch,
+                        "status": "skip_too_hard_zone",
+                        "requested_zone": slot_zone,
+                        "zone": effective_zone,
+                        "category_id": slot_profile.category_id,
+                    },
+                )
+                continue
             preferred_category = (
                 slot_profile.category_id if slot_profile is not None else teacher_decision.target_category
             )
             decision_mode = _zone_decision_mode(effective_zone)
             reason_code = _zone_reason_code(effective_zone)
             target_speedup_band = _zone_target_speedup_band(effective_zone)
-            mutation_instruction = (
-                "Generate a valid interface-preserving mutation."
-            )
+            mutation_instruction = "Generate a valid interface-preserving mutation."
             if slot_profile is not None:
                 mutation_instruction = (
                     teacher_decision.mutation_instruction
@@ -1316,13 +1454,9 @@ def main(argv: list[str] | None = None) -> int:
                         and teacher_decision.mutation_instruction
                     )
                     else (
-                        "Decompose complexity by removing one operation while preserving interface."
-                        if effective_zone == ZONE_TOO_HARD
-                        else (
-                            "Add one compositional operation while preserving interface."
-                            if effective_zone == ZONE_MASTERED
-                            else "Generate a structurally harder but learnable mutation."
-                        )
+                        "Add one compositional operation while preserving interface."
+                        if effective_zone == ZONE_MASTERED
+                        else "Generate a structurally harder but learnable mutation."
                     )
                 )
             if (
@@ -1386,9 +1520,7 @@ def main(argv: list[str] | None = None) -> int:
                 epoch=epoch,
             )
             mutator_target_category = seed_category
-            use_frontier_mutator = (
-                effective_zone == ZONE_TOO_HARD or decision_mode == "too_hard_decompose"
-            )
+            use_frontier_mutator = decision_mode == "too_hard_decompose"
             if use_frontier_mutator:
                 mutated = mutator_frontier.mutate(
                     seed_task,
@@ -1529,6 +1661,83 @@ def main(argv: list[str] | None = None) -> int:
                 name=mutated.name,
                 reference_code=mutated.reference_code,
             )
+            if args.enable_admission_gate:
+                if verifier is None:
+                    raise RuntimeError("Admission gate enabled but verifier backend not initialized.")
+                admission_result = _run_admission_gate(
+                    verifier,
+                    task_for_solver,
+                    k=args.admission_k,
+                    temperature=args.temperature,
+                    max_tokens=args.max_tokens,
+                    level=seed_level,
+                    eval_workers=args.eval_workers,
+                    speedup_threshold=args.admission_speedup_threshold,
+                )
+                admission_attempted_tasks += 1
+                admission_success_rate_sum += float(admission_result["success_rate"])
+                admission_gpu_hours += float(admission_result["wall_clock_s"]) / 3600.0
+                cost_tracker.add_cost(
+                    "admission_gate",
+                    gpu_hours=float(admission_result["wall_clock_s"]) / 3600.0,
+                    api_usd=0.0 if args.dry_run else args.admission_api_usd_per_task,
+                    epoch=epoch,
+                )
+                if not bool(admission_result["admitted"]):
+                    admission_rejected_tasks += 1
+                    solver_rollouts_skipped_by_admission += 1
+                    _append_jsonl(
+                        mutation_events_path,
+                        {
+                            "epoch": epoch,
+                            "status": "admission_rejected",
+                            "task_id": mutated.task_id,
+                            "seed_problem_id": seed_problem_id,
+                            "seed_category": seed_category,
+                            "zone": effective_zone,
+                            "admission_success_count": int(admission_result["success_count"]),
+                            "admission_total_count": int(admission_result["total_count"]),
+                            "admission_success_rate": float(admission_result["success_rate"]),
+                            "admission_speedup_threshold": float(args.admission_speedup_threshold),
+                        },
+                    )
+                    bank_eval = EvalResult(
+                        compiled=False,
+                        correctness=False,
+                        runtime_us=-1.0,
+                        ref_runtime_us=-1.0,
+                        speedup=0.0,
+                        metadata={
+                            "banked": True,
+                            "reason": "admission_rejected",
+                            "admission_success_count": int(admission_result["success_count"]),
+                            "admission_total_count": int(admission_result["total_count"]),
+                            "admission_success_rate": float(admission_result["success_rate"]),
+                            "admission_speedup_threshold": float(args.admission_speedup_threshold),
+                        },
+                    )
+                    replay_buffer.append(
+                        ReplayEntry(
+                            entry_id=f"admission_reject_{mutated.task_id}_{time.time_ns()}",
+                            task_id=mutated.task_id,
+                            parent_task_id=parent_task_id,
+                            problem_id=seed_problem_id,
+                            level=seed_level,
+                            category_id=mutated.category_id,
+                            task_reference_code=mutated.reference_code,
+                            kernel_code="",
+                            eval_result=bank_eval,
+                            reward=0.0,
+                            sampler_path=solver.sampler_path,
+                            backend="admission_gate",
+                            timestamp=time.time(),
+                            epoch=epoch,
+                            is_mutated=True,
+                        )
+                    )
+                    continue
+                admission_admitted_tasks += 1
+
             solve_outcome = solver.solve_task(
                 task_for_solver,
                 k=args.k,
@@ -1709,6 +1918,24 @@ def main(argv: list[str] | None = None) -> int:
             "signal_task_rate": signal_stats["effective_task_rate"],
             "low_signal_streak": low_signal_streak,
             "mini_reprofile_events": mini_reprofile_events,
+            "admission_attempted_tasks": admission_attempted_tasks,
+            "admission_admitted_tasks": admission_admitted_tasks,
+            "admission_rejected_tasks": admission_rejected_tasks,
+            "admission_reject_rate": (
+                admission_rejected_tasks / admission_attempted_tasks
+                if admission_attempted_tasks > 0
+                else 0.0
+            ),
+            "admission_mean_success_rate": (
+                admission_success_rate_sum / admission_attempted_tasks
+                if admission_attempted_tasks > 0
+                else 0.0
+            ),
+            "admission_gpu_hours": admission_gpu_hours,
+            "solver_rollouts_skipped_by_admission": solver_rollouts_skipped_by_admission,
+            "estimated_solver_compute_saved_samples": (
+                solver_rollouts_skipped_by_admission * max(0, int(args.k))
+            ),
         }
         _append_jsonl(kpi_dashboard_path, kpi_payload)
         prev_frontier_size = frontier_size
@@ -1757,6 +1984,15 @@ def main(argv: list[str] | None = None) -> int:
                     },
                     "teacher_failure_context_count": len(teacher_failure_context),
                     "mini_reprofile_events": mini_reprofile_events,
+                    "admission_gate_enabled": bool(args.enable_admission_gate),
+                    "admission_attempted_tasks": admission_attempted_tasks,
+                    "admission_admitted_tasks": admission_admitted_tasks,
+                    "admission_rejected_tasks": admission_rejected_tasks,
+                    "admission_reject_rate": (
+                        admission_rejected_tasks / admission_attempted_tasks
+                        if admission_attempted_tasks > 0
+                        else 0.0
+                    ),
                 },
                 "gradient_signal": {
                     "effective_tasks": effective_tasks,

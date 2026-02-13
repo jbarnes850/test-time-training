@@ -93,7 +93,7 @@ class DryRunSolverBackend:
         rewards: list[float] = []
         for idx in range(k):
             raw_action = "return x"
-            speedup = 1.0 + (((task.problem_id + idx) % 4) * 0.1)
+            speedup = 1.0 + (((task.problem_id + idx) % 4) * 0.25)
             result = EvalResult(
                 compiled=True,
                 correctness=True,

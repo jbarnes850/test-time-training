@@ -268,12 +268,12 @@ def test_tinker_teacher_backend_parses_json_and_infers_hard_frontier():
         target_max_completion=0.75,
     )
     assert decision.backend == "tinker"
-    assert decision.target_category == "composite:activation+matmul"
+    assert decision.target_category == "conv"
     # Decision must be inferred from measured profile, not trusted from model payload.
-    assert decision.hard_frontier is True
-    assert decision.decision_mode == "too_hard_decompose"
-    assert decision.reason_code == "decompose"
-    assert decision.target_speedup_band == (1.2, 1.6)
+    assert decision.hard_frontier is False
+    assert decision.decision_mode == "mastered_warmup"
+    assert decision.reason_code == "fallback"
+    assert decision.target_speedup_band == (1.8, 2.5)
     assert decision.mutation_instruction
 
 
@@ -379,8 +379,8 @@ def test_tinker_teacher_backend_falls_back_on_invalid_category():
         target_max_completion=0.75,
     )
     assert decision.backend == "heuristic"
-    assert decision.target_category == "composite:activation+matmul"
-    assert decision.hard_frontier is True
+    assert decision.target_category == "conv"
+    assert decision.hard_frontier is False
 
 
 def test_tinker_teacher_backend_enforces_zone_priority_policy_override():

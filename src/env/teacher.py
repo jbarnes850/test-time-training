@@ -100,54 +100,33 @@ def classify_task_zone(
     mastered_speedup_threshold: float = 2.0,
     too_hard_speedup_ceiling: float = 1.1,
 ) -> str:
+    # Keep legacy keyword args for compatibility, but zoneing is now
+    # success-rate based per Socratic-Zero.
+    _ = mastered_speedup_threshold
+    _ = too_hard_speedup_ceiling
     if not task_rows:
         return ZONE_UNKNOWN
 
-    k = len(task_rows)
-    pass_count = 0
-    strong_count = 0
-    correct_speedups: list[float] = []
-    fast_1 = False
+    success_count = 0
+    total = len(task_rows)
     for row in task_rows:
         correctness = bool(row.get("correctness", False))
         speedup = float(row.get("speedup", 0.0))
-        if correctness:
-            correct_speedups.append(speedup)
-            if speedup > 1.0:
-                fast_1 = True
         if correctness and speedup > pass_speedup_threshold:
-            pass_count += 1
-        if correctness and speedup > mastered_speedup_threshold:
-            strong_count += 1
+            success_count += 1
 
-    if strong_count == k and k > 0:
+    if success_count == total and total > 0:
         return ZONE_MASTERED
-
-    max_correct_speedup = max(correct_speedups) if correct_speedups else 0.0
-    if fast_1 and max_correct_speedup < too_hard_speedup_ceiling:
+    if success_count == 0:
         return ZONE_TOO_HARD
-    if pass_count == 0 and correct_speedups:
-        return ZONE_TOO_HARD
-    if pass_count == 0 and not correct_speedups:
-        return ZONE_TOO_HARD
-
-    if 0 < pass_count < k:
-        return ZONE_LEARNING
-    if pass_count == k:
-        mean_correct_speedup = (
-            statistics.mean(correct_speedups) if correct_speedups else 0.0
-        )
-        if mean_correct_speedup >= mastered_speedup_threshold:
-            return ZONE_MASTERED
-        return ZONE_LEARNING
     return ZONE_LEARNING
 
 
 def task_frontier_utility(
     task_rows: list[dict[str, Any]],
     *,
-    mu: float = 1.5,
-    sigma: float = 0.5,
+    mu: float = 0.5,
+    sigma: float = 0.2,
     pass_speedup_threshold: float = 1.5,
     min_runtime_us: float = 100.0,
 ) -> tuple[float, float, float, float]:
@@ -155,7 +134,7 @@ def task_frontier_utility(
         return 0.0, 0.0, 0.0, 0.0
 
     k = len(task_rows)
-    pass_count = 0
+    success_count = 0
     best_speedup = 0.0
     runtime_us_values: list[float] = []
     for row in task_rows:
@@ -165,14 +144,12 @@ def task_frontier_utility(
         if runtime_us > 0:
             runtime_us_values.append(runtime_us)
         if correctness and speedup > pass_speedup_threshold:
-            pass_count += 1
+            success_count += 1
         if correctness:
             best_speedup = max(best_speedup, speedup)
 
-    pass_rate = pass_count / k if k > 0 else 0.0
-    learnability_gate = max(0.0, min(1.0, 4.0 * pass_rate * (1.0 - pass_rate)))
-    speed_term = math.exp(-((best_speedup - mu) ** 2) / (2.0 * (sigma**2)))
-    utility = speed_term * learnability_gate
+    success_rate = success_count / k if k > 0 else 0.0
+    utility = math.exp(-((success_rate - mu) ** 2) / (2.0 * (sigma**2)))
 
     mean_runtime_us = statistics.mean(runtime_us_values) if runtime_us_values else 0.0
     runtime_norm = max(min_runtime_us, mean_runtime_us) / 1_000_000.0
@@ -432,10 +409,10 @@ def _best_profile_for_zone(profiles: list[CapabilityProfile], zone: str) -> Capa
 def _required_zone_by_policy(profiles: list[CapabilityProfile]) -> str:
     if any(p.zone == ZONE_LEARNING for p in profiles):
         return ZONE_LEARNING
-    if any(p.zone == ZONE_TOO_HARD for p in profiles):
-        return ZONE_TOO_HARD
     if any(p.zone == ZONE_MASTERED for p in profiles):
         return ZONE_MASTERED
+    if any(p.zone == ZONE_TOO_HARD for p in profiles):
+        return ZONE_TOO_HARD
     return ZONE_UNKNOWN
 
 
@@ -549,20 +526,6 @@ class HeuristicTeacherBackend:
             zone = ZONE_LEARNING
             reason = "Selected highest normalized utility in learning zone."
             reason_code = "edge_signal"
-        elif too_hard:
-            chosen = max(
-                too_hard,
-                key=lambda p: (
-                    p.normalized_utility,
-                    p.utility_score,
-                    p.speedup_var,
-                    -p.sample_count,
-                    p.category_id,
-                ),
-            )
-            zone = ZONE_TOO_HARD
-            reason = "No learning tasks available; selected decomposable too-hard zone task."
-            reason_code = "decompose"
         elif mastered:
             chosen = min(
                 mastered,
@@ -575,6 +538,20 @@ class HeuristicTeacherBackend:
             zone = ZONE_MASTERED
             reason = "Only mastered tasks available; selected weakest mastered task for warmup."
             reason_code = "warmup"
+        elif too_hard:
+            chosen = max(
+                too_hard,
+                key=lambda p: (
+                    p.normalized_utility,
+                    p.utility_score,
+                    p.speedup_var,
+                    -p.sample_count,
+                    p.category_id,
+                ),
+            )
+            zone = ZONE_TOO_HARD
+            reason = "Only too-hard tasks available; selected diagnostic category."
+            reason_code = "decompose"
         else:
             chosen = max(
                 profiles,
@@ -734,12 +711,12 @@ class TinkerLLMTeacherBackend:
             "from the provided categories to maximize expected capability gain per unit compute.\n"
             "Policy order:\n"
             "1) Prefer learning-zone categories with highest normalized_utility.\n"
-            "2) If no learning zone exists, choose too_hard for decomposition.\n"
-            "3) If only mastered exists, choose weakest mastered for warmup.\n"
+            "2) If no learning zone exists, choose weakest mastered for warmup.\n"
+            "3) Choose too_hard only when neither learning nor mastered exists.\n"
             "Hard constraints:\n"
             "- If any learning-zone categories exist, target_category MUST be from learning zone.\n"
-            "- If no learning categories exist but too_hard exists, target_category MUST be from too_hard zone.\n"
-            "- Only choose mastered when neither learning nor too_hard exists.\n"
+            "- If no learning categories exist but mastered exists, target_category MUST be from mastered zone.\n"
+            "- Only choose too_hard when neither learning nor mastered exists.\n"
             "Return STRICT JSON only with keys:\n"
             "target_category, decision_mode, reason_code, target_speedup_band, mutation_instruction, rationale.\n"
             "decision_mode must be one of: learning, mastered_warmup, too_hard_decompose, fallback.\n"
@@ -1048,9 +1025,14 @@ class CurriculumTeacher:
                 ZONE_TOO_HARD: sum(1 for z in task_zones if z == ZONE_TOO_HARD),
             }
             total_tasks = max(1, len(task_zones))
+            tie_priority = {
+                ZONE_LEARNING: 3,
+                ZONE_MASTERED: 2,
+                ZONE_TOO_HARD: 1,
+            }
             dominant_zone = max(
-                [ZONE_LEARNING, ZONE_TOO_HARD, ZONE_MASTERED],
-                key=lambda z: (zone_counts[z], -ZONE_ORDER.index(z)),
+                [ZONE_LEARNING, ZONE_MASTERED, ZONE_TOO_HARD],
+                key=lambda z: (zone_counts[z], tie_priority[z]),
             )
             mastered_rate = zone_counts[ZONE_MASTERED] / total_tasks
             learning_rate = zone_counts[ZONE_LEARNING] / total_tasks
