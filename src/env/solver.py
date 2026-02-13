@@ -38,6 +38,14 @@ class SolveOutcome:
     wall_clock_s: float
 
 
+@dataclass(frozen=True)
+class TrainStepResult:
+    sampler_path: str
+    training_executed: bool
+    datum_count: int
+    outcomes_used: int
+
+
 class SolverBackend(Protocol):
     backend_name: str
     provider_name: str
@@ -61,7 +69,7 @@ class SolverBackend(Protocol):
         outcomes: list[SolveOutcome],
         *,
         epoch: int,
-    ) -> str:
+    ) -> TrainStepResult:
         ...
 
     def metadata(self) -> dict[str, Any]:
@@ -118,9 +126,22 @@ class DryRunSolverBackend:
             wall_clock_s=time.time() - start,
         )
 
-    def train_on_outcomes(self, outcomes: list[SolveOutcome], *, epoch: int) -> str:
+    def train_on_outcomes(self, outcomes: list[SolveOutcome], *, epoch: int) -> TrainStepResult:
+        if not outcomes:
+            return TrainStepResult(
+                sampler_path=self.sampler_path,
+                training_executed=False,
+                datum_count=0,
+                outcomes_used=0,
+            )
         self.sampler_path = f"dry_run/sampler/epoch_{epoch}"
-        return self.sampler_path
+        datum_count = sum(max(0, len(outcome.rewards)) for outcome in outcomes)
+        return TrainStepResult(
+            sampler_path=self.sampler_path,
+            training_executed=True,
+            datum_count=datum_count,
+            outcomes_used=len(outcomes),
+        )
 
     def metadata(self) -> dict[str, Any]:
         return {
@@ -244,11 +265,17 @@ class TinkerSolverBackend:
         outcomes: list[SolveOutcome],
         *,
         epoch: int,
-    ) -> str:
+    ) -> TrainStepResult:
         if not self.training_enabled or self._training_client is None:
-            return self.sampler_path
+            return TrainStepResult(
+                sampler_path=self.sampler_path,
+                training_executed=False,
+                datum_count=0,
+                outcomes_used=0,
+            )
 
         all_datums = []
+        outcomes_used = 0
         for outcome in outcomes:
             if outcome.prompt is None:
                 continue
@@ -263,9 +290,16 @@ class TinkerSolverBackend:
                 advantages,
             )
             all_datums.extend(datums)
+            if datums:
+                outcomes_used += 1
 
         if not all_datums:
-            return self.sampler_path
+            return TrainStepResult(
+                sampler_path=self.sampler_path,
+                training_executed=False,
+                datum_count=0,
+                outcomes_used=0,
+            )
 
         fwd_bwd = self._training_client.forward_backward(all_datums, loss_fn="importance_sampling")
         optim = self._training_client.optim_step(
@@ -281,7 +315,12 @@ class TinkerSolverBackend:
             model_path=self.sampler_path
         )
         self._init_mode = "sampler_path"
-        return self.sampler_path
+        return TrainStepResult(
+            sampler_path=self.sampler_path,
+            training_executed=True,
+            datum_count=len(all_datums),
+            outcomes_used=outcomes_used,
+        )
 
     def metadata(self) -> dict[str, Any]:
         return {

@@ -779,6 +779,7 @@ def test_admission_gate_rejection_logs_and_skips_solver(tmp_path: Path, monkeypa
     rc = adaptive_train.main(
         [
             "--dry_run",
+            "--no-admission_bootstrap_passthrough",
             "--split_train",
             str(split_train),
             "--split_eval",
@@ -801,6 +802,7 @@ def test_admission_gate_rejection_logs_and_skips_solver(tmp_path: Path, monkeypa
     assert summary[0]["records_added"] == 0
     assert summary[0]["curriculum"]["admission_rejected_tasks"] >= 1
     assert summary[0]["curriculum"]["admission_attempted_tasks"] >= 1
+    assert summary[0]["curriculum"]["admission_bootstrap_passthrough_used"] == 0
     events = [json.loads(line) for line in (run_dir / "mutation_events.jsonl").read_text().splitlines()]
     assert any(row.get("status") == "admission_rejected" for row in events)
     kpi_rows = [json.loads(line) for line in (run_dir / "kpi_dashboard.jsonl").read_text().splitlines()]
@@ -889,3 +891,233 @@ def test_admission_gate_can_be_disabled(tmp_path: Path, monkeypatch):
     assert summary[0]["records_added"] > 0
     assert summary[0]["curriculum"]["admission_gate_enabled"] is False
     assert summary[0]["curriculum"]["admission_attempted_tasks"] == 0
+
+
+def test_bootstrap_admission_passthrough_allows_solver_rollout(tmp_path: Path, monkeypatch):
+    split_train = tmp_path / "split_train.json"
+    split_eval = tmp_path / "split_eval.json"
+    _write_split(split_train)
+    _write_split(split_eval)
+    monkeypatch.setattr(adaptive_train, "load_task", _fake_task)
+
+    def _profile_all_too_hard(
+        solver,
+        eval_tasks,
+        *,
+        profile_k,
+        temperature,
+        max_tokens,
+        eval_workers,
+    ):
+        rows = []
+        for handle in eval_tasks:
+            rows.append(
+                {
+                    "task_id": f"{handle.task.problem_id}",
+                    "sample_idx": 0,
+                    "category_id": handle.category_id,
+                    "correctness": True,
+                    "speedup": 1.01,
+                    "runtime_us": 1000.0,
+                    "fast_1": 1.0,
+                }
+            )
+        return rows, 0.01
+
+    counter = {"i": 0}
+
+    def _fake_mutate(
+        self,
+        seed_task,
+        *,
+        epoch,
+        seed_problem_id,
+        target_category,
+        level,
+        target_speedup_band,
+        failure_exemplars,
+        solver_trace_summary,
+        mutation_instruction,
+        decision_mode,
+        reason_code,
+        teacher_seed_rationale,
+    ):
+        counter["i"] += 1
+        return MutatedTask(
+            task_id=f"mut_{epoch}_{counter['i']}",
+            parent_task_id=f"seed_{seed_problem_id}",
+            seed_problem_id=seed_problem_id,
+            name=f"mut_task_{seed_problem_id}",
+            reference_code=seed_task.reference_code + f"\n# mut {counter['i']}",
+            interface_signature_hash="sig",
+            category_tags=("activation",),
+            category_id=target_category or "activation",
+            mutation_backend="dry_run",
+            mutation_model_id="dry_run",
+            mutation_prompt_hash=f"prompt_{counter['i']}",
+            novelty_hash=f"novel_{counter['i']}",
+            epoch_created=epoch,
+            mutation_type="logic_restructuring",
+            optimization_prompt="focus memory access",
+            teacher_decision_mode=decision_mode,
+            teacher_reason_code=reason_code,
+            teacher_target_speedup_band=target_speedup_band,
+            teacher_mutation_instruction=mutation_instruction,
+            solver_trace_summary=solver_trace_summary,
+            teacher_failure_entry_ids=tuple(
+                str(row.get("entry_id", "")) for row in (failure_exemplars or [])
+            ),
+            teacher_seed_rationale=teacher_seed_rationale or "",
+        )
+
+    def _reject_all(*args, **kwargs):
+        return {
+            "admitted": False,
+            "success_count": 0,
+            "total_count": 8,
+            "success_rate": 0.0,
+            "wall_clock_s": 0.01,
+            "eval_results": [],
+        }
+
+    monkeypatch.setattr(adaptive_train, "_profile_solver", _profile_all_too_hard)
+    monkeypatch.setattr(adaptive_train.KernelMutator, "mutate", _fake_mutate)
+    monkeypatch.setattr(adaptive_train, "_run_admission_gate", _reject_all)
+
+    run_dir = tmp_path / "run_bootstrap_passthrough"
+    rc = adaptive_train.main(
+        [
+            "--dry_run",
+            "--split_train",
+            str(split_train),
+            "--split_eval",
+            str(split_eval),
+            "--epochs",
+            "1",
+            "--tasks_per_epoch",
+            "1",
+            "--k",
+            "1",
+            "--mini_reprofile_every",
+            "0",
+            "--admission_bootstrap_passthrough_limit",
+            "1",
+            "--budget_tier",
+            "full",
+            "--log_path",
+            str(run_dir),
+        ]
+    )
+    assert rc == 0
+
+    summary = [json.loads(line) for line in (run_dir / "epoch_summary.jsonl").read_text().splitlines()]
+    assert summary
+    assert summary[0]["records_added"] > 0
+    assert summary[0]["curriculum"]["bootstrap_mode_entered"] is True
+    assert summary[0]["curriculum"]["admission_attempted_tasks"] >= 1
+    assert summary[0]["curriculum"]["admission_admitted_tasks"] >= 1
+    assert summary[0]["curriculum"]["admission_bootstrap_passthrough_used"] >= 1
+
+    events = [json.loads(line) for line in (run_dir / "mutation_events.jsonl").read_text().splitlines()]
+    assert any(row.get("status") == "admission_passthrough" for row in events)
+    assert not any(row.get("status") == "admission_rejected" for row in events)
+
+
+def test_training_cost_not_charged_when_no_training_step(tmp_path: Path, monkeypatch):
+    split_train = tmp_path / "split_train.json"
+    split_eval = tmp_path / "split_eval.json"
+    _write_split(split_train)
+    _write_split(split_eval)
+    monkeypatch.setattr(adaptive_train, "load_task", _fake_task)
+
+    counter = {"i": 0}
+
+    def _fake_mutate(
+        self,
+        seed_task,
+        *,
+        epoch,
+        seed_problem_id,
+        target_category,
+        level,
+        target_speedup_band,
+        failure_exemplars,
+        solver_trace_summary,
+        mutation_instruction,
+        decision_mode,
+        reason_code,
+        teacher_seed_rationale,
+    ):
+        counter["i"] += 1
+        return MutatedTask(
+            task_id=f"mut_{epoch}_{counter['i']}",
+            parent_task_id=f"seed_{seed_problem_id}",
+            seed_problem_id=seed_problem_id,
+            name=f"mut_task_{seed_problem_id}",
+            reference_code=seed_task.reference_code + f"\n# mut {counter['i']}",
+            interface_signature_hash="sig",
+            category_tags=("activation",),
+            category_id=target_category or "activation",
+            mutation_backend="dry_run",
+            mutation_model_id="dry_run",
+            mutation_prompt_hash=f"prompt_{counter['i']}",
+            novelty_hash=f"novel_{counter['i']}",
+            epoch_created=epoch,
+            mutation_type="logic_restructuring",
+            optimization_prompt="focus memory access",
+            teacher_decision_mode=decision_mode,
+            teacher_reason_code=reason_code,
+            teacher_target_speedup_band=target_speedup_band,
+            teacher_mutation_instruction=mutation_instruction,
+            solver_trace_summary=solver_trace_summary,
+            teacher_failure_entry_ids=tuple(
+                str(row.get("entry_id", "")) for row in (failure_exemplars or [])
+            ),
+            teacher_seed_rationale=teacher_seed_rationale or "",
+        )
+
+    def _reject_all(*args, **kwargs):
+        return {
+            "admitted": False,
+            "success_count": 0,
+            "total_count": 8,
+            "success_rate": 0.0,
+            "wall_clock_s": 0.01,
+            "eval_results": [],
+        }
+
+    monkeypatch.setattr(adaptive_train.KernelMutator, "mutate", _fake_mutate)
+    monkeypatch.setattr(adaptive_train, "_run_admission_gate", _reject_all)
+
+    run_dir = tmp_path / "run_train_no_step"
+    rc = adaptive_train.main(
+        [
+            "--dry_run",
+            "--enable_training",
+            "--no-admission_bootstrap_passthrough",
+            "--split_train",
+            str(split_train),
+            "--split_eval",
+            str(split_eval),
+            "--epochs",
+            "1",
+            "--tasks_per_epoch",
+            "1",
+            "--k",
+            "2",
+            "--budget_tier",
+            "full",
+            "--log_path",
+            str(run_dir),
+        ]
+    )
+    assert rc == 0
+    summary = [json.loads(line) for line in (run_dir / "epoch_summary.jsonl").read_text().splitlines()]
+    assert summary
+    assert summary[0]["curriculum"]["training_attempted"] is True
+    assert summary[0]["curriculum"]["training_executed"] is False
+    assert summary[0]["curriculum"]["training_datum_count"] == 0
+
+    tracker = json.loads((run_dir / "cost_tracker.json").read_text())
+    train_events = [event for event in tracker["events"] if event.get("component") == "train"]
+    assert train_events == []

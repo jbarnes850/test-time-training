@@ -1089,6 +1089,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--admission_k", type=int, default=8)
     parser.add_argument("--admission_speedup_threshold", type=float, default=1.5)
     parser.add_argument(
+        "--admission_bootstrap_passthrough",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+    )
+    parser.add_argument("--admission_bootstrap_passthrough_limit", type=int, default=1)
+    parser.add_argument(
         "--verifier_backend",
         type=str,
         default="",
@@ -1132,6 +1138,8 @@ def main(argv: list[str] | None = None) -> int:
         raise ValueError("--admission_k must be >= 1")
     if args.admission_speedup_threshold <= 0:
         raise ValueError("--admission_speedup_threshold must be > 0")
+    if args.admission_bootstrap_passthrough_limit < 0:
+        raise ValueError("--admission_bootstrap_passthrough_limit must be >= 0")
     if not (0.0 <= args.learnability_low < args.learnability_high <= 1.0):
         raise ValueError("--learnability_low/--learnability_high must satisfy 0 <= low < high <= 1.")
     if not (0.0 <= args.curriculum_target_learning_share <= 1.0):
@@ -1296,6 +1304,8 @@ def main(argv: list[str] | None = None) -> int:
     run_config["admission_gate_enabled"] = bool(args.enable_admission_gate)
     run_config["admission_k"] = int(args.admission_k)
     run_config["admission_speedup_threshold"] = float(args.admission_speedup_threshold)
+    run_config["admission_bootstrap_passthrough"] = bool(args.admission_bootstrap_passthrough)
+    run_config["admission_bootstrap_passthrough_limit"] = int(args.admission_bootstrap_passthrough_limit)
     run_config["resolved_verifier_backend"] = (
         verifier.backend_name if verifier is not None else "disabled"
     )
@@ -1468,6 +1478,7 @@ def main(argv: list[str] | None = None) -> int:
         admission_success_rate_sum = 0.0
         admission_gpu_hours = 0.0
         solver_rollouts_skipped_by_admission = 0
+        admission_bootstrap_passthrough_used = 0
 
         while slot_idx < slot_count:
             slot_zone = zone_plan[slot_idx] if slot_idx < len(zone_plan) else ZONE_LEARNING
@@ -1780,60 +1791,88 @@ def main(argv: list[str] | None = None) -> int:
                     epoch=epoch,
                 )
                 if not bool(admission_result["admitted"]):
-                    admission_rejected_tasks += 1
-                    solver_rollouts_skipped_by_admission += 1
-                    _append_jsonl(
-                        mutation_events_path,
-                        {
-                            "epoch": epoch,
-                            "status": "admission_rejected",
-                            "task_id": mutated.task_id,
-                            "seed_problem_id": seed_problem_id,
-                            "seed_category": seed_category,
-                            "zone": effective_zone,
-                            "admission_success_count": int(admission_result["success_count"]),
-                            "admission_total_count": int(admission_result["total_count"]),
-                            "admission_success_rate": float(admission_result["success_rate"]),
-                            "admission_speedup_threshold": float(args.admission_speedup_threshold),
-                            "bootstrap_mode": bootstrap_mode,
-                            "bootstrap_seed_source": bootstrap_seed_source,
-                        },
+                    allow_bootstrap_passthrough = (
+                        bootstrap_mode
+                        and args.admission_bootstrap_passthrough
+                        and admission_bootstrap_passthrough_used
+                        < args.admission_bootstrap_passthrough_limit
                     )
-                    bank_eval = EvalResult(
-                        compiled=False,
-                        correctness=False,
-                        runtime_us=-1.0,
-                        ref_runtime_us=-1.0,
-                        speedup=0.0,
-                        metadata={
-                            "banked": True,
-                            "reason": "admission_rejected",
-                            "admission_success_count": int(admission_result["success_count"]),
-                            "admission_total_count": int(admission_result["total_count"]),
-                            "admission_success_rate": float(admission_result["success_rate"]),
-                            "admission_speedup_threshold": float(args.admission_speedup_threshold),
-                        },
-                    )
-                    replay_buffer.append(
-                        ReplayEntry(
-                            entry_id=f"admission_reject_{mutated.task_id}_{time.time_ns()}",
-                            task_id=mutated.task_id,
-                            parent_task_id=parent_task_id,
-                            problem_id=seed_problem_id,
-                            level=seed_level,
-                            category_id=mutated.category_id,
-                            task_reference_code=mutated.reference_code,
-                            kernel_code="",
-                            eval_result=bank_eval,
-                            reward=0.0,
-                            sampler_path=solver.sampler_path,
-                            backend="admission_gate",
-                            timestamp=time.time(),
-                            epoch=epoch,
-                            is_mutated=True,
+                    if allow_bootstrap_passthrough:
+                        admission_bootstrap_passthrough_used += 1
+                        _append_jsonl(
+                            mutation_events_path,
+                            {
+                                "epoch": epoch,
+                                "status": "admission_passthrough",
+                                "task_id": mutated.task_id,
+                                "seed_problem_id": seed_problem_id,
+                                "seed_category": seed_category,
+                                "zone": effective_zone,
+                                "admission_success_count": int(admission_result["success_count"]),
+                                "admission_total_count": int(admission_result["total_count"]),
+                                "admission_success_rate": float(admission_result["success_rate"]),
+                                "admission_speedup_threshold": float(args.admission_speedup_threshold),
+                                "bootstrap_mode": bootstrap_mode,
+                                "bootstrap_seed_source": bootstrap_seed_source,
+                                "passthrough_limit": int(args.admission_bootstrap_passthrough_limit),
+                                "passthrough_used": int(admission_bootstrap_passthrough_used),
+                            },
                         )
-                    )
-                    continue
+                    else:
+                        admission_rejected_tasks += 1
+                        solver_rollouts_skipped_by_admission += 1
+                        _append_jsonl(
+                            mutation_events_path,
+                            {
+                                "epoch": epoch,
+                                "status": "admission_rejected",
+                                "task_id": mutated.task_id,
+                                "seed_problem_id": seed_problem_id,
+                                "seed_category": seed_category,
+                                "zone": effective_zone,
+                                "admission_success_count": int(admission_result["success_count"]),
+                                "admission_total_count": int(admission_result["total_count"]),
+                                "admission_success_rate": float(admission_result["success_rate"]),
+                                "admission_speedup_threshold": float(args.admission_speedup_threshold),
+                                "bootstrap_mode": bootstrap_mode,
+                                "bootstrap_seed_source": bootstrap_seed_source,
+                            },
+                        )
+                        bank_eval = EvalResult(
+                            compiled=False,
+                            correctness=False,
+                            runtime_us=-1.0,
+                            ref_runtime_us=-1.0,
+                            speedup=0.0,
+                            metadata={
+                                "banked": True,
+                                "reason": "admission_rejected",
+                                "admission_success_count": int(admission_result["success_count"]),
+                                "admission_total_count": int(admission_result["total_count"]),
+                                "admission_success_rate": float(admission_result["success_rate"]),
+                                "admission_speedup_threshold": float(args.admission_speedup_threshold),
+                            },
+                        )
+                        replay_buffer.append(
+                            ReplayEntry(
+                                entry_id=f"admission_reject_{mutated.task_id}_{time.time_ns()}",
+                                task_id=mutated.task_id,
+                                parent_task_id=parent_task_id,
+                                problem_id=seed_problem_id,
+                                level=seed_level,
+                                category_id=mutated.category_id,
+                                task_reference_code=mutated.reference_code,
+                                kernel_code="",
+                                eval_result=bank_eval,
+                                reward=0.0,
+                                sampler_path=solver.sampler_path,
+                                backend="admission_gate",
+                                timestamp=time.time(),
+                                epoch=epoch,
+                                is_mutated=True,
+                            )
+                        )
+                        continue
                 admission_admitted_tasks += 1
 
             solve_outcome = solver.solve_task(
@@ -1966,13 +2005,27 @@ def main(argv: list[str] | None = None) -> int:
                         zone_plan = zone_plan[:slot_idx] + remaining_plan[:remaining_slots]
                     mini_reprofile_events += 1
 
+        training_activity = {
+            "attempted": bool(args.enable_training),
+            "executed": False,
+            "datum_count": 0,
+            "outcomes_used": 0,
+        }
         if args.enable_training:
-            solver.sampler_path = solver.train_on_outcomes(solve_outcomes, epoch=epoch)
-            cost_tracker.add_cost(
-                "train",
-                api_usd=0.0 if args.dry_run else args.train_api_usd_per_epoch,
-                epoch=epoch,
-            )
+            train_result = solver.train_on_outcomes(solve_outcomes, epoch=epoch)
+            solver.sampler_path = train_result.sampler_path
+            training_activity = {
+                "attempted": True,
+                "executed": bool(train_result.training_executed),
+                "datum_count": int(train_result.datum_count),
+                "outcomes_used": int(train_result.outcomes_used),
+            }
+            if train_result.training_executed:
+                cost_tracker.add_cost(
+                    "train",
+                    api_usd=0.0 if args.dry_run else args.train_api_usd_per_epoch,
+                    epoch=epoch,
+                )
 
         signal_stats = _gradient_signal_summary(
             solve_outcomes,
@@ -2033,9 +2086,14 @@ def main(argv: list[str] | None = None) -> int:
             ),
             "admission_gpu_hours": admission_gpu_hours,
             "solver_rollouts_skipped_by_admission": solver_rollouts_skipped_by_admission,
+            "admission_bootstrap_passthrough_used": admission_bootstrap_passthrough_used,
             "estimated_solver_compute_saved_samples": (
                 solver_rollouts_skipped_by_admission * max(0, int(args.k))
             ),
+            "training_attempted": training_activity["attempted"],
+            "training_executed": training_activity["executed"],
+            "training_datum_count": training_activity["datum_count"],
+            "training_outcomes_used": training_activity["outcomes_used"],
             "bootstrap_mode_entered": bootstrap_mode_entered,
             "bootstrap_mode_active_end": bootstrap_mode,
             "bootstrap_count": bootstrap_count,
@@ -2097,6 +2155,11 @@ def main(argv: list[str] | None = None) -> int:
                         if admission_attempted_tasks > 0
                         else 0.0
                     ),
+                    "admission_bootstrap_passthrough_used": admission_bootstrap_passthrough_used,
+                    "training_attempted": training_activity["attempted"],
+                    "training_executed": training_activity["executed"],
+                    "training_datum_count": training_activity["datum_count"],
+                    "training_outcomes_used": training_activity["outcomes_used"],
                     "bootstrap_mode_entered": bootstrap_mode_entered,
                     "bootstrap_mode_active_end": bootstrap_mode,
                     "bootstrap_count": bootstrap_count,

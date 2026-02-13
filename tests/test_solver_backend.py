@@ -31,9 +31,21 @@ def test_dry_run_solver_backend_solves_and_trains():
     assert all(r.correctness for r in outcome.eval_results)
     assert all(r.speedup >= 1.0 for r in outcome.eval_results)
 
-    new_path = solver.train_on_outcomes([outcome], epoch=2)
-    assert new_path.endswith("epoch_2")
-    assert solver.sampler_path == new_path
+    train_result = solver.train_on_outcomes([outcome], epoch=2)
+    assert train_result.training_executed is True
+    assert train_result.datum_count == 3
+    assert train_result.outcomes_used == 1
+    assert train_result.sampler_path.endswith("epoch_2")
+    assert solver.sampler_path == train_result.sampler_path
+
+
+def test_dry_run_solver_backend_skips_empty_training():
+    solver = DryRunSolverBackend()
+    train_result = solver.train_on_outcomes([], epoch=2)
+    assert train_result.training_executed is False
+    assert train_result.datum_count == 0
+    assert train_result.outcomes_used == 0
+    assert train_result.sampler_path == solver.sampler_path
 
 
 def test_dry_run_solver_metadata_shape():
