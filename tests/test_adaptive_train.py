@@ -200,6 +200,8 @@ def test_allocate_level_counts_sums_to_total():
 def test_apply_experiment_arm_defaults_b0_clears_sampler_init():
     args = SimpleNamespace(
         experiment_arm="B0",
+        model="Qwen/Qwen3-30B-A3B-Instruct-2507",
+        solver_model_id="Qwen/Qwen3-30B-A3B-Instruct-2507",
         teacher_strategy="inverse_correctness",
         curriculum_controller="fixed",
         seed_use_mixed_pool=False,
@@ -212,6 +214,8 @@ def test_apply_experiment_arm_defaults_b0_clears_sampler_init():
     )
     resolved, applied = adaptive_train._apply_experiment_arm_defaults(args)
     assert resolved == "B0"
+    assert args.model == adaptive_train.PAPER_BASE_MODEL_ID
+    assert args.solver_model_id == ""
     assert args.curriculum_controller == "adaptive"
     assert args.seed_use_mixed_pool is True
     assert args.seed_pool_mode == "uniform_levels"
@@ -261,6 +265,7 @@ def test_experiment_arm_b1_enforces_baseline_purity(tmp_path: Path, monkeypatch)
     assert rc == 0
     run_config = json.loads((run_dir / "run_config.json").read_text())
     assert run_config["resolved_experiment_arm"] == "B1"
+    assert run_config["model"] == adaptive_train.PAPER_BASE_MODEL_ID
     assert run_config["teacher_strategy"] == "random"
     assert run_config["curriculum_controller"] == "fixed"
     assert run_config["seed_pool_mode"] == "uniform_levels"
@@ -268,6 +273,45 @@ def test_experiment_arm_b1_enforces_baseline_purity(tmp_path: Path, monkeypatch)
 
     summary = [json.loads(line) for line in (run_dir / "epoch_summary.jsonl").read_text().splitlines()]
     assert summary[0]["curriculum"]["controller"] == "fixed"
+
+
+def test_non_custom_arm_rejects_non_paper_model(tmp_path: Path, monkeypatch):
+    split_train = tmp_path / "split_train.json"
+    split_eval = tmp_path / "split_eval.json"
+    _write_split(split_train)
+    _write_split(split_eval)
+    monkeypatch.setattr(adaptive_train, "load_task", _fake_task)
+    monkeypatch.setattr(adaptive_train, "_apply_experiment_arm_defaults", lambda args: ("B1", {}))
+    try:
+        adaptive_train.main(
+            [
+                "--dry_run",
+                "--experiment_arm",
+                "B1",
+                "--model",
+                "Qwen/Qwen3-30B-A3B-Instruct-2507",
+                "--split_train",
+                str(split_train),
+                "--split_eval",
+                str(split_eval),
+                "--epochs",
+                "1",
+                "--curriculum_controller",
+                "fixed",
+                "--seed_pool_mode",
+                "uniform_levels",
+                "--tasks_per_epoch",
+                "1",
+                "--k",
+                "1",
+                "--log_path",
+                str(tmp_path / "run_bad_model"),
+            ]
+        )
+    except ValueError as exc:
+        assert "pinned to paper base model" in str(exc)
+    else:
+        raise AssertionError("Expected ValueError for non-paper model on standardized arm")
 
 
 def test_low_gradient_signal_gate_halts_run(tmp_path: Path, monkeypatch):

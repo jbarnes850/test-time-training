@@ -93,6 +93,7 @@ EXPERIMENT_ARM_POLICY = {
 }
 
 PRIMARY_MATCHED_COMPUTE_ARMS = ("B0", "B1", "B2", "C")
+PAPER_BASE_MODEL_ID = "openai/gpt-oss-120b"
 
 
 @dataclass
@@ -677,21 +678,29 @@ def _apply_experiment_arm_defaults(args: argparse.Namespace) -> tuple[str, dict[
 
     # Enforce baseline purity and explicit arm semantics.
     if arm == "B1":
+        _set_arm_default(args, "model", PAPER_BASE_MODEL_ID, applied)
+        _set_arm_default(args, "solver_model_id", "", applied)
         _set_arm_default(args, "teacher_strategy", "random", applied)
         _set_arm_default(args, "curriculum_controller", "fixed", applied)
         _set_arm_default(args, "seed_use_mixed_pool", True, applied)
         _set_arm_default(args, "seed_pool_mode", "uniform_levels", applied)
     elif arm == "B2":
+        _set_arm_default(args, "model", PAPER_BASE_MODEL_ID, applied)
+        _set_arm_default(args, "solver_model_id", "", applied)
         _set_arm_default(args, "teacher_strategy", "easy_to_hard_static", applied)
         _set_arm_default(args, "curriculum_controller", "fixed", applied)
         _set_arm_default(args, "seed_use_mixed_pool", True, applied)
         _set_arm_default(args, "seed_pool_mode", "uniform_levels", applied)
     elif arm == "C":
+        _set_arm_default(args, "model", PAPER_BASE_MODEL_ID, applied)
+        _set_arm_default(args, "solver_model_id", "", applied)
         _set_arm_default(args, "teacher_strategy", "frontier_band", applied)
         _set_arm_default(args, "curriculum_controller", "adaptive", applied)
         _set_arm_default(args, "seed_use_mixed_pool", True, applied)
         _set_arm_default(args, "seed_pool_mode", "uniform_levels", applied)
     elif arm == "B0":
+        _set_arm_default(args, "model", PAPER_BASE_MODEL_ID, applied)
+        _set_arm_default(args, "solver_model_id", "", applied)
         _set_arm_default(args, "teacher_strategy", "frontier_band", applied)
         _set_arm_default(args, "curriculum_controller", "adaptive", applied)
         _set_arm_default(args, "seed_use_mixed_pool", True, applied)
@@ -701,6 +710,8 @@ def _apply_experiment_arm_defaults(args: argparse.Namespace) -> tuple[str, dict[
         _set_arm_default(args, "sampler_path", "", applied)
         _set_arm_default(args, "checkpoint_jsonl", "", applied)
     elif arm == "B3":
+        _set_arm_default(args, "model", PAPER_BASE_MODEL_ID, applied)
+        _set_arm_default(args, "solver_model_id", "", applied)
         _set_arm_default(args, "curriculum_controller", "fixed", applied)
         _set_arm_default(args, "enable_training", False, applied)
         _set_arm_default(args, "tasks_per_epoch", 0, applied)
@@ -844,6 +855,13 @@ def main(argv: list[str] | None = None) -> int:
         raise ValueError(f"{resolved_arm} must run with seed_pool_mode=uniform_levels.")
     if resolved_arm == "B3" and args.enable_training:
         raise ValueError("B3 is a status-quo anchor and must disable training.")
+    if resolved_arm != "custom":
+        resolved_solver_model = args.solver_model_id or args.model
+        if resolved_solver_model != PAPER_BASE_MODEL_ID:
+            raise ValueError(
+                f"{resolved_arm} is pinned to paper base model '{PAPER_BASE_MODEL_ID}'. "
+                f"Use --experiment_arm custom for non-paper model experiments."
+            )
 
     solver_backend_name = "dry_run" if args.dry_run else args.solver_backend
     teacher_backend_name = "heuristic" if args.dry_run else args.teacher_backend
