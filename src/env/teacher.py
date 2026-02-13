@@ -371,6 +371,32 @@ def _normalize_speedup_band(value: Any, *, fallback: tuple[float, float]) -> tup
     return fallback
 
 
+def _best_profile_for_zone(profiles: list[CapabilityProfile], zone: str) -> CapabilityProfile | None:
+    candidates = [p for p in profiles if p.zone == zone]
+    if not candidates:
+        return None
+    return max(
+        candidates,
+        key=lambda p: (
+            p.normalized_utility,
+            p.utility_score,
+            p.speedup_var,
+            -p.sample_count,
+            p.category_id,
+        ),
+    )
+
+
+def _required_zone_by_policy(profiles: list[CapabilityProfile]) -> str:
+    if any(p.zone == ZONE_LEARNING for p in profiles):
+        return ZONE_LEARNING
+    if any(p.zone == ZONE_TOO_HARD for p in profiles):
+        return ZONE_TOO_HARD
+    if any(p.zone == ZONE_MASTERED for p in profiles):
+        return ZONE_MASTERED
+    return ZONE_UNKNOWN
+
+
 @dataclass(frozen=True)
 class TeacherDecision:
     target_category: str
@@ -614,11 +640,19 @@ class TinkerLLMTeacherBackend:
             "1) Prefer learning-zone categories with highest normalized_utility.\n"
             "2) If no learning zone exists, choose too_hard for decomposition.\n"
             "3) If only mastered exists, choose weakest mastered for warmup.\n"
+            "Hard constraints:\n"
+            "- If any learning-zone categories exist, target_category MUST be from learning zone.\n"
+            "- If no learning categories exist but too_hard exists, target_category MUST be from too_hard zone.\n"
+            "- Only choose mastered when neither learning nor too_hard exists.\n"
             "Return STRICT JSON only with keys:\n"
             "target_category, decision_mode, reason_code, target_speedup_band, mutation_instruction, rationale.\n"
             "decision_mode must be one of: learning, mastered_warmup, too_hard_decompose, fallback.\n"
             "reason_code must be one of: edge_signal, max_variance, data_sparse, decompose, warmup, fallback.\n"
-            "target_speedup_band must be [low, high] numeric."
+            "target_speedup_band must be [low, high] numeric and follow mode policy:\n"
+            "- learning: [1.3, 1.8]\n"
+            "- too_hard_decompose: [1.2, 1.6]\n"
+            "- mastered_warmup: [1.8, 2.5]\n"
+            "- fallback: [1.2, 1.8]"
         )
         profile_lines = [
             {
@@ -701,20 +735,29 @@ class TinkerLLMTeacherBackend:
         chosen_profile = profile_by_category[target_category]
 
         inferred_zone = chosen_profile.zone if chosen_profile.zone in ZONE_ORDER else ZONE_UNKNOWN
+        required_zone = _required_zone_by_policy(profiles)
+        policy_override_applied = False
+        if required_zone in {ZONE_LEARNING, ZONE_TOO_HARD, ZONE_MASTERED} and inferred_zone != required_zone:
+            override_profile = _best_profile_for_zone(profiles, required_zone)
+            if override_profile is not None:
+                target_category = override_profile.category_id
+                chosen_profile = override_profile
+                inferred_zone = required_zone
+                policy_override_applied = True
+
         inferred_mode = _decision_mode_for_zone(inferred_zone)
         model_mode = str(payload.get("decision_mode", "")).strip().lower()
-        if model_mode not in VALID_DECISION_MODES:
+        if model_mode not in VALID_DECISION_MODES or model_mode != inferred_mode:
             model_mode = inferred_mode
 
         reason_code = str(payload.get("reason_code", "fallback")).strip().lower()
         if reason_code not in VALID_REASON_CODES:
             reason_code = "fallback"
+        if policy_override_applied:
+            reason_code = "fallback"
 
-        fallback_band = _target_speedup_band_for_zone(inferred_zone)
-        target_speedup_band = _normalize_speedup_band(
-            payload.get("target_speedup_band"),
-            fallback=fallback_band,
-        )
+        # Keep speedup bands deterministic by zone for stable curriculum control.
+        target_speedup_band = _target_speedup_band_for_zone(inferred_zone)
         mutation_instruction = str(
             payload.get("mutation_instruction") or _mutation_instruction_for_zone(inferred_zone)
         ).strip()
@@ -728,6 +771,11 @@ class TinkerLLMTeacherBackend:
                 break
         hard_frontier = inferred_hard or inferred_zone == ZONE_TOO_HARD
         rationale = str(payload.get("rationale", "LLM teacher decision."))
+        if policy_override_applied:
+            rationale = (
+                f"Policy override to zone={inferred_zone} due to zone-priority constraints. "
+                f"Original model choice was adjusted for deterministic curriculum control."
+            )
 
         return TeacherDecision(
             target_category=target_category,

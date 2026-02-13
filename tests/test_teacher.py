@@ -289,6 +289,62 @@ def test_tinker_teacher_backend_falls_back_on_invalid_category():
     assert decision.hard_frontier is True
 
 
+def test_tinker_teacher_backend_enforces_zone_priority_policy_override():
+    response_text = (
+        '{"target_category":"conv",'
+        '"decision_mode":"mastered_warmup",'
+        '"reason_code":"warmup",'
+        '"target_speedup_band":[2.4,2.9],'
+        '"mutation_instruction":"warmup",'
+        '"rationale":"choose mastered"}'
+    )
+    backend = _build_mock_tinker_backend(response_text)
+    profiles = [
+        CapabilityProfile(
+            epoch=1,
+            split="eval",
+            category_id="conv",
+            n_tasks=2,
+            correctness_rate=0.95,
+            mean_speedup=2.6,
+            speedup_var=0.2,
+            fast_1_rate=0.95,
+            failure_rate=0.05,
+            sample_count=2,
+            zone="mastered",
+            utility_score=0.1,
+            normalized_utility=0.1,
+            mean_best_speedup=3.0,
+        ),
+        CapabilityProfile(
+            epoch=1,
+            split="eval",
+            category_id="composite:activation+matmul",
+            n_tasks=2,
+            correctness_rate=0.6,
+            mean_speedup=1.5,
+            speedup_var=0.3,
+            fast_1_rate=0.5,
+            failure_rate=0.4,
+            sample_count=2,
+            zone="learning",
+            utility_score=0.8,
+            normalized_utility=0.7,
+            mean_best_speedup=1.8,
+        ),
+    ]
+    decision = backend.decide(
+        profiles,
+        target_min_completion=0.25,
+        target_max_completion=0.75,
+    )
+    assert decision.target_category == "composite:activation+matmul"
+    assert decision.zone == "learning"
+    assert decision.decision_mode == "learning"
+    assert decision.reason_code == "fallback"
+    assert decision.target_speedup_band == (1.3, 1.8)
+
+
 def test_classify_task_zone_matches_l2_style_regimes():
     regime_simple_rows = [
         {"correctness": True, "speedup": 2.2},
