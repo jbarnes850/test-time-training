@@ -1,4 +1,4 @@
-from dataclasses import dataclass, asdict
+from dataclasses import asdict, dataclass
 from typing import Any, Dict, Optional
 
 
@@ -36,6 +36,56 @@ class StepResult:
     eval_result: EvalResult
     done: bool = True
     info: Optional[Dict[str, Any]] = None
+
+
+@dataclass(frozen=True)
+class MutatedTask:
+    task_id: str
+    parent_task_id: str
+    seed_problem_id: Optional[int]
+    name: str
+    reference_code: str
+    interface_signature_hash: str
+    category_tags: tuple[str, ...]
+    category_id: str
+    mutation_backend: str
+    mutation_model_id: str
+    mutation_prompt_hash: str
+    novelty_hash: str
+    epoch_created: int
+
+
+@dataclass(frozen=True)
+class CapabilityProfile:
+    epoch: int
+    split: str
+    category_id: str
+    n_tasks: int
+    correctness_rate: float
+    mean_speedup: float
+    speedup_var: float
+    fast_1_rate: float
+    failure_rate: float
+    sample_count: int
+
+
+@dataclass(frozen=True)
+class ReplayEntry:
+    entry_id: str
+    task_id: str
+    parent_task_id: Optional[str]
+    problem_id: Optional[int]
+    level: Optional[int]
+    category_id: str
+    task_reference_code: str
+    kernel_code: str
+    eval_result: EvalResult
+    reward: float
+    sampler_path: str
+    backend: str
+    timestamp: float
+    epoch: int
+    is_mutated: bool = False
 
 
 def to_json_dict(obj) -> Dict[str, Any]:
