@@ -895,12 +895,17 @@ def main(argv: list[str] | None = None) -> int:
                 slot_zone,
                 teacher_decision.target_category,
             )
+            effective_zone = (
+                slot_profile.zone
+                if slot_profile is not None and slot_profile.zone in {ZONE_MASTERED, ZONE_LEARNING, ZONE_TOO_HARD}
+                else slot_zone
+            )
             preferred_category = (
                 slot_profile.category_id if slot_profile is not None else teacher_decision.target_category
             )
-            decision_mode = _zone_decision_mode(slot_zone)
-            reason_code = _zone_reason_code(slot_zone)
-            target_speedup_band = _zone_target_speedup_band(slot_zone)
+            decision_mode = _zone_decision_mode(effective_zone)
+            reason_code = _zone_reason_code(effective_zone)
+            target_speedup_band = _zone_target_speedup_band(effective_zone)
             mutation_instruction = (
                 "Generate a valid interface-preserving mutation."
             )
@@ -908,22 +913,22 @@ def main(argv: list[str] | None = None) -> int:
                 mutation_instruction = (
                     teacher_decision.mutation_instruction
                     if (
-                        slot_zone == ZONE_LEARNING
+                        effective_zone == ZONE_LEARNING
                         and preferred_category == teacher_decision.target_category
                         and teacher_decision.mutation_instruction
                     )
                     else (
                         "Decompose complexity by removing one operation while preserving interface."
-                        if slot_zone == ZONE_TOO_HARD
+                        if effective_zone == ZONE_TOO_HARD
                         else (
                             "Add one compositional operation while preserving interface."
-                            if slot_zone == ZONE_MASTERED
+                            if effective_zone == ZONE_MASTERED
                             else "Generate a structurally harder but learnable mutation."
                         )
                     )
                 )
             if (
-                slot_zone == ZONE_LEARNING
+                effective_zone == ZONE_LEARNING
                 and preferred_category == teacher_decision.target_category
                 and teacher_decision.decision_mode
             ):
@@ -958,7 +963,7 @@ def main(argv: list[str] | None = None) -> int:
             )
             mutator_target_category = seed_category
             use_frontier_mutator = (
-                slot_zone == ZONE_TOO_HARD or decision_mode == "too_hard_decompose"
+                effective_zone == ZONE_TOO_HARD or decision_mode == "too_hard_decompose"
             )
             if use_frontier_mutator:
                 mutated = mutator_frontier.mutate(
@@ -1020,7 +1025,8 @@ def main(argv: list[str] | None = None) -> int:
                         "status": "mutation_failed",
                         "seed_problem_id": seed_problem_id,
                         "seed_category": seed_category,
-                        "zone": slot_zone,
+                        "requested_zone": slot_zone,
+                        "zone": effective_zone,
                         "decision_mode": decision_mode,
                         "reason_code": reason_code,
                         "target_speedup_band": list(target_speedup_band),
@@ -1056,7 +1062,7 @@ def main(argv: list[str] | None = None) -> int:
                 replay_buffer.append(bank_entry)
                 continue
 
-            realized_zone_counts[slot_zone] += 1
+            realized_zone_counts[effective_zone] = realized_zone_counts.get(effective_zone, 0) + 1
             _append_jsonl(
                 mutation_events_path,
                 {
@@ -1065,7 +1071,8 @@ def main(argv: list[str] | None = None) -> int:
                     "task_id": mutated.task_id,
                     "seed_problem_id": seed_problem_id,
                     "seed_category": seed_category,
-                    "zone": slot_zone,
+                    "requested_zone": slot_zone,
+                    "zone": effective_zone,
                     "decision_mode": mutated.teacher_decision_mode,
                     "reason_code": mutated.teacher_reason_code,
                     "target_speedup_band": list(mutated.teacher_target_speedup_band),
