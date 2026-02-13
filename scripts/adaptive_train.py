@@ -27,6 +27,9 @@ from src.env.teacher import (
     CurriculumTeacher,
     HeuristicTeacherBackend,
     TinkerLLMTeacherBackend,
+    ZONE_LEARNING,
+    ZONE_MASTERED,
+    ZONE_TOO_HARD,
     category_id,
     infer_task_categories,
 )
@@ -256,6 +259,121 @@ def _allocate_level_counts(total: int, weights: list[float]) -> list[int]:
     return counts
 
 
+def _normalize_zone_quotas(mastered: float, learning: float, too_hard: float) -> dict[str, float]:
+    quotas = {
+        ZONE_MASTERED: max(0.0, float(mastered)),
+        ZONE_LEARNING: max(0.0, float(learning)),
+        ZONE_TOO_HARD: max(0.0, float(too_hard)),
+    }
+    total = sum(quotas.values())
+    if total <= 0:
+        return {ZONE_MASTERED: 0.15, ZONE_LEARNING: 0.60, ZONE_TOO_HARD: 0.25}
+    return {zone: value / total for zone, value in quotas.items()}
+
+
+def _zone_counts_from_profiles(profiles: list[CapabilityProfile]) -> dict[str, float]:
+    counts = {ZONE_MASTERED: 0.0, ZONE_LEARNING: 0.0, ZONE_TOO_HARD: 0.0}
+    for profile in profiles:
+        counts[ZONE_MASTERED] += profile.n_tasks * profile.mastered_task_rate
+        counts[ZONE_LEARNING] += profile.n_tasks * profile.learning_task_rate
+        counts[ZONE_TOO_HARD] += profile.n_tasks * profile.too_hard_task_rate
+    return counts
+
+
+def _adaptive_zone_quotas(
+    base: dict[str, float],
+    zone_counts: dict[str, float],
+    *,
+    target_learning_share: float,
+    max_adjustment: float,
+) -> tuple[dict[str, float], dict[str, float]]:
+    adjusted = dict(base)
+    total = sum(zone_counts.values())
+    if total <= 0:
+        return adjusted, {"learning_share": 0.0, "delta_learning": 0.0}
+    learning_share = zone_counts.get(ZONE_LEARNING, 0.0) / total
+    delta = target_learning_share - learning_share
+    shift = max(-max_adjustment, min(max_adjustment, delta))
+    if abs(shift) < 1e-9:
+        return adjusted, {"learning_share": learning_share, "delta_learning": 0.0}
+
+    adjusted[ZONE_LEARNING] = max(0.0, adjusted[ZONE_LEARNING] + shift)
+    donor_total = adjusted[ZONE_MASTERED] + adjusted[ZONE_TOO_HARD]
+    if donor_total > 0:
+        shrink = adjusted[ZONE_LEARNING] - base[ZONE_LEARNING]
+        adjusted[ZONE_MASTERED] = max(
+            0.0, adjusted[ZONE_MASTERED] - (shrink * (adjusted[ZONE_MASTERED] / donor_total))
+        )
+        adjusted[ZONE_TOO_HARD] = max(
+            0.0, adjusted[ZONE_TOO_HARD] - (shrink * (adjusted[ZONE_TOO_HARD] / donor_total))
+        )
+    adjusted = _normalize_zone_quotas(
+        adjusted[ZONE_MASTERED],
+        adjusted[ZONE_LEARNING],
+        adjusted[ZONE_TOO_HARD],
+    )
+    return adjusted, {"learning_share": learning_share, "delta_learning": shift}
+
+
+def _allocate_zone_counts(total_slots: int, quotas: dict[str, float]) -> dict[str, int]:
+    zones = [ZONE_MASTERED, ZONE_LEARNING, ZONE_TOO_HARD]
+    weights = [quotas.get(zone, 0.0) for zone in zones]
+    counts = _allocate_level_counts(total_slots, weights)
+    return {zone: count for zone, count in zip(zones, counts)}
+
+
+def _build_zone_plan(zone_counts: dict[str, int]) -> list[str]:
+    plan: list[str] = []
+    for zone in (ZONE_MASTERED, ZONE_LEARNING, ZONE_TOO_HARD):
+        plan.extend([zone] * max(0, int(zone_counts.get(zone, 0))))
+    return plan
+
+
+def _pick_category_for_zone(
+    profiles_by_zone: dict[str, list[CapabilityProfile]],
+    zone: str,
+    fallback_category: str,
+) -> CapabilityProfile | None:
+    candidates = profiles_by_zone.get(zone, [])
+    if candidates:
+        return candidates[0]
+    for alt in (ZONE_LEARNING, ZONE_TOO_HARD, ZONE_MASTERED):
+        alt_candidates = profiles_by_zone.get(alt, [])
+        if alt_candidates:
+            return alt_candidates[0]
+    return None
+
+
+def _zone_target_speedup_band(zone: str) -> tuple[float, float]:
+    if zone == ZONE_LEARNING:
+        return (1.3, 1.8)
+    if zone == ZONE_TOO_HARD:
+        return (1.2, 1.6)
+    if zone == ZONE_MASTERED:
+        return (1.8, 2.5)
+    return (1.2, 1.8)
+
+
+def _zone_decision_mode(zone: str) -> str:
+    if zone == ZONE_LEARNING:
+        return "learning"
+    if zone == ZONE_TOO_HARD:
+        return "too_hard_decompose"
+    if zone == ZONE_MASTERED:
+        return "mastered_warmup"
+    return "fallback"
+
+
+def _zone_reason_code(zone: str) -> str:
+    if zone == ZONE_LEARNING:
+        return "edge_signal"
+    if zone == ZONE_TOO_HARD:
+        return "decompose"
+    if zone == ZONE_MASTERED:
+        return "warmup"
+    return "fallback"
+
+
 def _prepare_task_handles(problem_ids: list[int], level: int) -> list[TaskHandle]:
     handles: list[TaskHandle] = []
     for pid in problem_ids:
@@ -360,6 +478,7 @@ def _profile_solver(
                     "category_id": handle.category_id,
                     "correctness": result.correctness,
                     "speedup": result.speedup,
+                    "runtime_us": result.runtime_us,
                     "fast_1": 1.0 if result.correctness and result.speedup > 1.0 else 0.0,
                 }
             )
@@ -506,6 +625,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--teacher_max_tokens", type=int, default=384)
     parser.add_argument("--learnability_low", type=float, default=0.25)
     parser.add_argument("--learnability_high", type=float, default=0.75)
+    parser.add_argument("--curriculum_mastered_quota", type=float, default=0.15)
+    parser.add_argument("--curriculum_learning_quota", type=float, default=0.60)
+    parser.add_argument("--curriculum_too_hard_quota", type=float, default=0.25)
+    parser.add_argument("--curriculum_target_learning_share", type=float, default=0.50)
+    parser.add_argument("--curriculum_max_adjustment", type=float, default=0.15)
     parser.add_argument("--replay_recency_window", type=int, default=200)
     parser.add_argument("--log_path", type=str, default="runs/adaptive_phase1")
     parser.add_argument("--resume_from", type=str, default="")
@@ -530,6 +654,10 @@ def main(argv: list[str] | None = None) -> int:
         raise ValueError("--eval_workers must be >= 1")
     if not (0.0 <= args.learnability_low < args.learnability_high <= 1.0):
         raise ValueError("--learnability_low/--learnability_high must satisfy 0 <= low < high <= 1.")
+    if not (0.0 <= args.curriculum_target_learning_share <= 1.0):
+        raise ValueError("--curriculum_target_learning_share must be in [0, 1].")
+    if not (0.0 <= args.curriculum_max_adjustment <= 1.0):
+        raise ValueError("--curriculum_max_adjustment must be in [0, 1].")
 
     solver_backend_name = "dry_run" if args.dry_run else args.solver_backend
     teacher_backend_name = "heuristic" if args.dry_run else args.teacher_backend
@@ -550,6 +678,8 @@ def main(argv: list[str] | None = None) -> int:
     capability_profiles_path = run_dir / "capability_profiles.jsonl"
     replay_path = run_dir / "replay_entries.jsonl"
     mutator_stats_path = run_dir / "mutator_stats.jsonl"
+    mutation_events_path = run_dir / "mutation_events.jsonl"
+    kpi_dashboard_path = run_dir / "kpi_dashboard.jsonl"
 
     replay_buffer = ReplayBuffer(replay_path)
     if teacher_backend_name == "tinker":
@@ -642,6 +772,11 @@ def main(argv: list[str] | None = None) -> int:
         str(level): sum(1 for h in train_tasks if h.level == level)
         for level in sorted({h.level for h in train_tasks})
     }
+    run_config["resolved_curriculum_base_quotas"] = _normalize_zone_quotas(
+        args.curriculum_mastered_quota,
+        args.curriculum_learning_quota,
+        args.curriculum_too_hard_quota,
+    )
     _write_json(run_config_path, run_config)
 
     mutator_primary = KernelMutator(
@@ -674,6 +809,8 @@ def main(argv: list[str] | None = None) -> int:
 
     budget_cap = _budget_cap(args)
     start_epoch = next_epoch
+    prev_frontier_size: float | None = None
+    prev_too_hard_size: float | None = None
 
     for epoch in range(start_epoch, args.epochs):
         mutator_primary.reset_stats()
@@ -697,6 +834,7 @@ def main(argv: list[str] | None = None) -> int:
             break
 
         epoch_start_total = cost_tracker.total_usd
+        epoch_start_gpu_hours = cost_tracker.total_gpu_hours
         epoch_records = 0
         successful_records = 0
         profile_rows, profile_wall = _profile_solver(
@@ -728,15 +866,90 @@ def main(argv: list[str] | None = None) -> int:
             )
 
         ranked_train_tasks = teacher.rank_tasks(train_tasks, strategy=args.teacher_strategy)
+        profiles_by_zone = teacher.profiles_by_zone()
+        base_quotas = _normalize_zone_quotas(
+            args.curriculum_mastered_quota,
+            args.curriculum_learning_quota,
+            args.curriculum_too_hard_quota,
+        )
+        observed_zone_counts = _zone_counts_from_profiles(profiles)
+        adjusted_quotas, quota_adjustment = _adaptive_zone_quotas(
+            base_quotas,
+            observed_zone_counts,
+            target_learning_share=args.curriculum_target_learning_share,
+            max_adjustment=args.curriculum_max_adjustment,
+        )
+        slot_count = min(args.tasks_per_epoch, len(ranked_train_tasks))
+        desired_zone_counts = _allocate_zone_counts(slot_count, adjusted_quotas)
+        zone_plan = _build_zone_plan(desired_zone_counts)
+        if len(zone_plan) < slot_count:
+            zone_plan.extend([ZONE_LEARNING] * (slot_count - len(zone_plan)))
+        zone_plan = zone_plan[:slot_count]
+        realized_zone_counts = {ZONE_MASTERED: 0, ZONE_LEARNING: 0, ZONE_TOO_HARD: 0}
+
         solve_outcomes: list[SolveOutcome] = []
 
-        for _ in range(min(args.tasks_per_epoch, len(ranked_train_tasks))):
+        for slot_zone in zone_plan:
+            slot_profile = _pick_category_for_zone(
+                profiles_by_zone,
+                slot_zone,
+                teacher_decision.target_category,
+            )
+            preferred_category = (
+                slot_profile.category_id if slot_profile is not None else teacher_decision.target_category
+            )
+            decision_mode = _zone_decision_mode(slot_zone)
+            reason_code = _zone_reason_code(slot_zone)
+            target_speedup_band = _zone_target_speedup_band(slot_zone)
+            mutation_instruction = (
+                "Generate a valid interface-preserving mutation."
+            )
+            if slot_profile is not None:
+                mutation_instruction = (
+                    teacher_decision.mutation_instruction
+                    if (
+                        slot_zone == ZONE_LEARNING
+                        and preferred_category == teacher_decision.target_category
+                        and teacher_decision.mutation_instruction
+                    )
+                    else (
+                        "Decompose complexity by removing one operation while preserving interface."
+                        if slot_zone == ZONE_TOO_HARD
+                        else (
+                            "Add one compositional operation while preserving interface."
+                            if slot_zone == ZONE_MASTERED
+                            else "Generate a structurally harder but learnable mutation."
+                        )
+                    )
+                )
+            if (
+                slot_zone == ZONE_LEARNING
+                and preferred_category == teacher_decision.target_category
+                and teacher_decision.decision_mode
+            ):
+                decision_mode = teacher_decision.decision_mode
+                reason_code = teacher_decision.reason_code or reason_code
+                target_speedup_band = teacher_decision.target_speedup_band or target_speedup_band
+                if teacher_decision.mutation_instruction:
+                    mutation_instruction = teacher_decision.mutation_instruction
+
             seed_task, parent_task_id, seed_problem_id, seed_category, seed_level = _select_seed_task(
                 replay_buffer=replay_buffer,
                 ranked_train_tasks=ranked_train_tasks,
                 profiles=profiles,
                 replay_recency_window=args.replay_recency_window,
-                preferred_category=teacher_decision.target_category,
+                preferred_category=preferred_category,
+            )
+            preferred_profile = teacher.latest_profile().get(seed_category)
+            solver_trace_summary = (
+                f"category={seed_category} zone={preferred_profile.zone} "
+                f"correctness={preferred_profile.correctness_rate:.3f} "
+                f"fast_1={preferred_profile.fast_1_rate:.3f} "
+                f"mean_speedup={preferred_profile.mean_speedup:.3f} "
+                f"mean_best_speedup={preferred_profile.mean_best_speedup:.3f} "
+                f"utility={preferred_profile.utility_score:.4f}"
+                if preferred_profile is not None
+                else f"category={seed_category} no_profile"
             )
             cost_tracker.add_cost(
                 "mutate",
@@ -744,13 +957,21 @@ def main(argv: list[str] | None = None) -> int:
                 epoch=epoch,
             )
             mutator_target_category = seed_category
-            if teacher_decision.hard_frontier:
+            use_frontier_mutator = (
+                slot_zone == ZONE_TOO_HARD or decision_mode == "too_hard_decompose"
+            )
+            if use_frontier_mutator:
                 mutated = mutator_frontier.mutate(
                     seed_task,
                     epoch=epoch,
                     seed_problem_id=seed_problem_id,
                     target_category=mutator_target_category,
                     level=seed_level,
+                    target_speedup_band=target_speedup_band,
+                    solver_trace_summary=solver_trace_summary,
+                    mutation_instruction=mutation_instruction,
+                    decision_mode=decision_mode,
+                    reason_code=reason_code,
                 )
                 if mutated is None:
                     mutated = mutator_primary.mutate(
@@ -759,6 +980,11 @@ def main(argv: list[str] | None = None) -> int:
                         seed_problem_id=seed_problem_id,
                         target_category=mutator_target_category,
                         level=seed_level,
+                        target_speedup_band=target_speedup_band,
+                        solver_trace_summary=solver_trace_summary,
+                        mutation_instruction=mutation_instruction,
+                        decision_mode=decision_mode,
+                        reason_code=reason_code,
                     )
             else:
                 mutated = mutator_primary.mutate(
@@ -767,6 +993,11 @@ def main(argv: list[str] | None = None) -> int:
                     seed_problem_id=seed_problem_id,
                     target_category=mutator_target_category,
                     level=seed_level,
+                    target_speedup_band=target_speedup_band,
+                    solver_trace_summary=solver_trace_summary,
+                    mutation_instruction=mutation_instruction,
+                    decision_mode=decision_mode,
+                    reason_code=reason_code,
                 )
                 if mutated is None:
                     mutated = mutator_frontier.mutate(
@@ -775,8 +1006,28 @@ def main(argv: list[str] | None = None) -> int:
                         seed_problem_id=seed_problem_id,
                         target_category=mutator_target_category,
                         level=seed_level,
+                        target_speedup_band=target_speedup_band,
+                        solver_trace_summary=solver_trace_summary,
+                        mutation_instruction=mutation_instruction,
+                        decision_mode=decision_mode,
+                        reason_code=reason_code,
                     )
             if mutated is None:
+                _append_jsonl(
+                    mutation_events_path,
+                    {
+                        "epoch": epoch,
+                        "status": "mutation_failed",
+                        "seed_problem_id": seed_problem_id,
+                        "seed_category": seed_category,
+                        "zone": slot_zone,
+                        "decision_mode": decision_mode,
+                        "reason_code": reason_code,
+                        "target_speedup_band": list(target_speedup_band),
+                        "mutation_instruction": mutation_instruction,
+                        "solver_trace_summary": solver_trace_summary,
+                    },
+                )
                 bank_eval = EvalResult(
                     compiled=False,
                     correctness=False,
@@ -804,6 +1055,27 @@ def main(argv: list[str] | None = None) -> int:
                 )
                 replay_buffer.append(bank_entry)
                 continue
+
+            realized_zone_counts[slot_zone] += 1
+            _append_jsonl(
+                mutation_events_path,
+                {
+                    "epoch": epoch,
+                    "status": "mutated",
+                    "task_id": mutated.task_id,
+                    "seed_problem_id": seed_problem_id,
+                    "seed_category": seed_category,
+                    "zone": slot_zone,
+                    "decision_mode": mutated.teacher_decision_mode,
+                    "reason_code": mutated.teacher_reason_code,
+                    "target_speedup_band": list(mutated.teacher_target_speedup_band),
+                    "mutation_instruction": mutated.teacher_mutation_instruction,
+                    "solver_trace_summary": mutated.solver_trace_summary,
+                    "mutation_type": mutated.mutation_type,
+                    "mutation_backend": mutated.mutation_backend,
+                    "mutation_model_id": mutated.mutation_model_id,
+                },
+            )
 
             task_for_solver = KernelTask(
                 problem_id=seed_problem_id,
@@ -861,6 +1133,34 @@ def main(argv: list[str] | None = None) -> int:
             )
 
         epoch_cost = cost_tracker.finalize_epoch(epoch, epoch_start_total)
+        epoch_gpu_hours = max(0.0, cost_tracker.total_gpu_hours - epoch_start_gpu_hours)
+        aggregate_fast_1 = (
+            statistics.mean([float(row.get("fast_1", 0.0)) for row in profile_rows]) if profile_rows else 0.0
+        )
+        frontier_size = observed_zone_counts.get(ZONE_LEARNING, 0.0)
+        too_hard_size = observed_zone_counts.get(ZONE_TOO_HARD, 0.0)
+        frontier_delta = (
+            0.0 if prev_frontier_size is None else frontier_size - prev_frontier_size
+        )
+        too_hard_reduction = (
+            0.0 if prev_too_hard_size is None else (prev_too_hard_size - too_hard_size)
+        )
+        kpi_payload = {
+            "epoch": epoch,
+            "aggregate_fast_1": aggregate_fast_1,
+            "frontier_size": frontier_size,
+            "frontier_size_delta": frontier_delta,
+            "too_hard_size": too_hard_size,
+            "too_hard_reduction": too_hard_reduction,
+            "fast_1_per_gpu_hour": (aggregate_fast_1 / epoch_gpu_hours) if epoch_gpu_hours > 0 else 0.0,
+            "fast_1_per_usd": (aggregate_fast_1 / epoch_cost) if epoch_cost > 0 else 0.0,
+            "epoch_gpu_hours": epoch_gpu_hours,
+            "epoch_cost_usd": epoch_cost,
+        }
+        _append_jsonl(kpi_dashboard_path, kpi_payload)
+        prev_frontier_size = frontier_size
+        prev_too_hard_size = too_hard_size
+
         _write_json(cost_tracker_path, cost_tracker.to_dict())
         checkpoint_payload = {
             "next_epoch": epoch + 1,
@@ -888,6 +1188,19 @@ def main(argv: list[str] | None = None) -> int:
                 "running_total_usd": cost_tracker.total_usd,
                 "sampler_path": solver.sampler_path,
                 "teacher_decision": asdict(teacher_decision),
+                "curriculum": {
+                    "base_quotas": base_quotas,
+                    "adjusted_quotas": adjusted_quotas,
+                    "observed_zone_counts": observed_zone_counts,
+                    "quota_adjustment": quota_adjustment,
+                    "desired_zone_counts": desired_zone_counts,
+                    "realized_zone_counts": realized_zone_counts,
+                    "realized_zone_pct": {
+                        zone: (count / max(1, sum(realized_zone_counts.values())))
+                        for zone, count in realized_zone_counts.items()
+                    },
+                },
+                "kpi": kpi_payload,
                 "mutator_stats": {
                     "primary": mutator_primary.stats.as_dict(),
                     "frontier": mutator_frontier.stats.as_dict(),

@@ -74,6 +74,8 @@ def test_adaptive_train_dry_run_writes_required_artifacts(tmp_path: Path, monkey
         "capability_profiles.jsonl",
         "replay_entries.jsonl",
         "mutator_stats.jsonl",
+        "mutation_events.jsonl",
+        "kpi_dashboard.jsonl",
         "cost_tracker.json",
         "checkpoint_state.json",
     ]:
@@ -83,6 +85,17 @@ def test_adaptive_train_dry_run_writes_required_artifacts(tmp_path: Path, monkey
     assert summary
     assert summary[0]["epoch"] == 0
     assert "mutator_stats" in summary[0]
+    assert "curriculum" in summary[0]
+    assert "kpi" in summary[0]
+
+    mutation_events = [
+        json.loads(line) for line in (run_dir / "mutation_events.jsonl").read_text().splitlines()
+    ]
+    assert mutation_events
+    assert "decision_mode" in mutation_events[0]
+    assert "reason_code" in mutation_events[0]
+    assert "target_speedup_band" in mutation_events[0]
+    assert "mutation_instruction" in mutation_events[0]
 
     run_config = json.loads((run_dir / "run_config.json").read_text())
     assert run_config["resolved_solver_backend"] == "dry_run"
