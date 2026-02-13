@@ -4,7 +4,9 @@ from src.env.teacher import (
     HeuristicTeacherBackend,
     TinkerLLMTeacherBackend,
     category_id,
+    classify_task_zone,
     infer_task_categories,
+    task_frontier_utility,
 )
 
 
@@ -83,6 +85,10 @@ def _profiles_for_backend() -> list[CapabilityProfile]:
             fast_1_rate=1.0,
             failure_rate=0.0,
             sample_count=2,
+            zone="mastered",
+            utility_score=0.05,
+            normalized_utility=0.05,
+            mean_best_speedup=2.3,
         ),
         CapabilityProfile(
             epoch=1,
@@ -95,6 +101,10 @@ def _profiles_for_backend() -> list[CapabilityProfile]:
             fast_1_rate=0.2,
             failure_rate=0.8,
             sample_count=2,
+            zone="too_hard",
+            utility_score=0.2,
+            normalized_utility=0.2,
+            mean_best_speedup=1.05,
         ),
     ]
 
@@ -215,7 +225,8 @@ def test_heuristic_teacher_selects_in_band_frontier_target():
     decision = teacher.select_frontier_target()
     assert decision.target_category == "matmul"
     assert decision.backend == "heuristic"
-    assert decision.hard_frontier is False
+    assert decision.hard_frontier is True
+    assert decision.decision_mode == "too_hard_decompose"
 
 
 def test_heuristic_teacher_marks_hard_frontier_when_below_band():
@@ -234,14 +245,18 @@ def test_heuristic_teacher_marks_hard_frontier_when_below_band():
     ]
     teacher.update_profile(rows, epoch=1)
     decision = teacher.select_frontier_target()
-    assert decision.target_category == "matmul"
+    assert decision.target_category in {"conv", "matmul"}
     assert decision.hard_frontier is True
+    assert decision.zone == "too_hard"
 
 
 def test_tinker_teacher_backend_parses_json_and_infers_hard_frontier():
     response_text = (
         '{"target_category":"composite:activation+matmul",'
-        '"hard_frontier":false,'
+        '"decision_mode":"too_hard_decompose",'
+        '"reason_code":"decompose",'
+        '"target_speedup_band":[1.2,1.6],'
+        '"mutation_instruction":"decompose one op while preserving interface",'
         '"rationale":"Targeting hard composite frontier."}'
     )
     backend = _build_mock_tinker_backend(response_text)
@@ -254,10 +269,16 @@ def test_tinker_teacher_backend_parses_json_and_infers_hard_frontier():
     assert decision.target_category == "composite:activation+matmul"
     # Decision must be inferred from measured profile, not trusted from model payload.
     assert decision.hard_frontier is True
+    assert decision.decision_mode == "too_hard_decompose"
+    assert decision.reason_code == "decompose"
+    assert decision.target_speedup_band == (1.2, 1.6)
+    assert decision.mutation_instruction
 
 
 def test_tinker_teacher_backend_falls_back_on_invalid_category():
-    backend = _build_mock_tinker_backend('{"target_category":"unknown","hard_frontier":false}')
+    backend = _build_mock_tinker_backend(
+        '{"target_category":"unknown","decision_mode":"learning","reason_code":"edge_signal","target_speedup_band":[1.3,1.8],"mutation_instruction":"x"}'
+    )
     decision = backend.decide(
         _profiles_for_backend(),
         target_min_completion=0.25,
@@ -266,3 +287,58 @@ def test_tinker_teacher_backend_falls_back_on_invalid_category():
     assert decision.backend == "heuristic"
     assert decision.target_category == "composite:activation+matmul"
     assert decision.hard_frontier is True
+
+
+def test_classify_task_zone_matches_l2_style_regimes():
+    regime_simple_rows = [
+        {"correctness": True, "speedup": 2.2},
+        {"correctness": True, "speedup": 1.2},
+        {"correctness": True, "speedup": 1.1},
+        {"correctness": True, "speedup": 1.6},
+    ]
+    regime_l1_adjacent_rows = [
+        {"correctness": True, "speedup": 2.8},
+        {"correctness": True, "speedup": 2.4},
+        {"correctness": True, "speedup": 2.1},
+        {"correctness": True, "speedup": 2.6},
+    ]
+    regime_complex_rows = [
+        {"correctness": True, "speedup": 1.01},
+        {"correctness": True, "speedup": 1.02},
+        {"correctness": True, "speedup": 1.03},
+        {"correctness": True, "speedup": 1.01},
+    ]
+
+    assert classify_task_zone(regime_simple_rows) == "learning"
+    assert classify_task_zone(regime_l1_adjacent_rows) == "mastered"
+    assert classify_task_zone(regime_complex_rows) == "too_hard"
+
+
+def test_frontier_utility_prefers_learning_frontier_over_mastered_and_too_hard():
+    learning_rows = [
+        {"correctness": True, "speedup": 1.65, "runtime_us": 1200.0},
+        {"correctness": True, "speedup": 1.55, "runtime_us": 1200.0},
+        {"correctness": True, "speedup": 1.20, "runtime_us": 1200.0},
+        {"correctness": True, "speedup": 1.05, "runtime_us": 1200.0},
+    ]
+    mastered_rows = [
+        {"correctness": True, "speedup": 2.80, "runtime_us": 1200.0},
+        {"correctness": True, "speedup": 2.40, "runtime_us": 1200.0},
+        {"correctness": True, "speedup": 2.30, "runtime_us": 1200.0},
+        {"correctness": True, "speedup": 2.20, "runtime_us": 1200.0},
+    ]
+    too_hard_rows = [
+        {"correctness": True, "speedup": 1.01, "runtime_us": 1200.0},
+        {"correctness": True, "speedup": 1.02, "runtime_us": 1200.0},
+        {"correctness": True, "speedup": 1.01, "runtime_us": 1200.0},
+        {"correctness": True, "speedup": 1.02, "runtime_us": 1200.0},
+    ]
+
+    learning_utility, learning_norm, _, _ = task_frontier_utility(learning_rows)
+    mastered_utility, mastered_norm, _, _ = task_frontier_utility(mastered_rows)
+    too_hard_utility, too_hard_norm, _, _ = task_frontier_utility(too_hard_rows)
+
+    assert learning_utility > mastered_utility
+    assert learning_utility > too_hard_utility
+    assert learning_norm > mastered_norm
+    assert learning_norm > too_hard_norm

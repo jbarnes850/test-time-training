@@ -143,16 +143,47 @@ _MUTATION_TYPE_RE = re.compile(r"^\s*MUTATION_TYPE:\s*(.+?)\s*$", re.MULTILINE |
 _OPT_PROMPT_RE = re.compile(r"^\s*OPTIMIZATION_PROMPT:\s*(.+?)\s*$", re.MULTILINE | re.IGNORECASE)
 
 
-def build_mutation_prompt(seed_task: KernelTask, target_category: str | None = None) -> str:
+def build_mutation_prompt(
+    seed_task: KernelTask,
+    target_category: str | None = None,
+    *,
+    target_speedup_band: tuple[float, float] | None = None,
+    solver_trace_summary: str | None = None,
+    mutation_instruction: str | None = None,
+    decision_mode: str | None = None,
+    reason_code: str | None = None,
+) -> str:
     target_hint = (
         f"Target frontier category: {target_category}\n"
         if target_category and target_category != "unknown"
         else ""
     )
+    speedup_hint = ""
+    if target_speedup_band is not None:
+        speedup_hint = (
+            f"Target solver speedup band: [{target_speedup_band[0]:.2f}, {target_speedup_band[1]:.2f}]\n"
+        )
+    trace_hint = (
+        f"Solver trace summary:\n{solver_trace_summary.strip()}\n\n"
+        if solver_trace_summary and solver_trace_summary.strip()
+        else ""
+    )
+    instruction_hint = (
+        f"Teacher mutation instruction:\n{mutation_instruction.strip()}\n\n"
+        if mutation_instruction and mutation_instruction.strip()
+        else ""
+    )
+    mode_hint = f"Decision mode: {decision_mode}\n" if decision_mode else ""
+    reason_hint = f"Reason code: {reason_code}\n" if reason_code else ""
     return (
         "Generate one mutated benchmark kernel task.\n"
         "Prioritize difficult but learnable task variation while preserving interface contract.\n\n"
         f"{target_hint}"
+        f"{speedup_hint}"
+        f"{mode_hint}"
+        f"{reason_hint}"
+        f"{instruction_hint}"
+        f"{trace_hint}"
         f"Seed task id: {seed_task.problem_id}\n"
         f"Seed task name: {seed_task.name}\n\n"
         "Seed reference code:\n"
@@ -417,8 +448,21 @@ class KernelMutator:
         seed_problem_id: int | None = None,
         target_category: str | None = None,
         level: int = 1,
+        target_speedup_band: tuple[float, float] | None = None,
+        solver_trace_summary: str | None = None,
+        mutation_instruction: str | None = None,
+        decision_mode: str | None = None,
+        reason_code: str | None = None,
     ) -> MutatedTask | None:
-        prompt = build_mutation_prompt(seed_task, target_category=target_category)
+        prompt = build_mutation_prompt(
+            seed_task,
+            target_category=target_category,
+            target_speedup_band=target_speedup_band,
+            solver_trace_summary=solver_trace_summary,
+            mutation_instruction=mutation_instruction,
+            decision_mode=decision_mode,
+            reason_code=reason_code,
+        )
         prompt_hash = _sha256_text(prompt)
         for _ in range(self.max_retries):
             self._stats.attempts_total += 1
@@ -475,6 +519,11 @@ class KernelMutator:
                 epoch_created=epoch,
                 mutation_type=proposal.mutation_type,
                 optimization_prompt=proposal.optimization_prompt,
+                teacher_decision_mode=decision_mode or "",
+                teacher_reason_code=reason_code or "",
+                teacher_target_speedup_band=target_speedup_band or (0.0, 0.0),
+                teacher_mutation_instruction=mutation_instruction or "",
+                solver_trace_summary=solver_trace_summary or "",
             )
         return None
 

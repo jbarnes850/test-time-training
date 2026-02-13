@@ -25,7 +25,9 @@ from src.env.teacher import (
     TeacherPolicyBackend,
     TinkerLLMTeacherBackend,
     category_id,
+    classify_task_zone,
     infer_task_categories,
+    task_frontier_utility,
 )
 from src.env.mutator import (
     ApiMutatorBackend,

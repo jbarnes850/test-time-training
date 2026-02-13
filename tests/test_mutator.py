@@ -149,7 +149,15 @@ def test_mutate_returns_mutated_task_with_lineage(tmp_path: Path):
     backend = DummyBackend(["bad response", VALID_MUTATION_RESPONSE])
     mutator = KernelMutator(backend, replay, max_retries=3)
 
-    mutated = mutator.mutate(_seed_task(), epoch=2)
+    mutated = mutator.mutate(
+        _seed_task(),
+        epoch=2,
+        decision_mode="learning",
+        reason_code="edge_signal",
+        target_speedup_band=(1.3, 1.8),
+        mutation_instruction="Add one operation while preserving interface.",
+        solver_trace_summary="category=activation mean_speedup=1.3",
+    )
     assert mutated is not None
     assert mutated.seed_problem_id == 4
     assert mutated.mutation_backend == "dummy"
@@ -158,6 +166,11 @@ def test_mutate_returns_mutated_task_with_lineage(tmp_path: Path):
     assert mutated.optimization_prompt
     assert "activation" in mutated.category_tags
     assert mutated.category_id in {"activation", "composite:activation+reduction"}
+    assert mutated.teacher_decision_mode == "learning"
+    assert mutated.teacher_reason_code == "edge_signal"
+    assert mutated.teacher_target_speedup_band == (1.3, 1.8)
+    assert mutated.teacher_mutation_instruction
+    assert mutated.solver_trace_summary
     assert mutator.stats.attempts_total == 2
     assert mutator.stats.accepted == 1
     assert mutator.stats.format_failures == 1

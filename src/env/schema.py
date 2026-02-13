@@ -55,6 +55,11 @@ class MutatedTask:
     epoch_created: int
     mutation_type: str = "unspecified"
     optimization_prompt: str = ""
+    teacher_decision_mode: str = ""
+    teacher_reason_code: str = ""
+    teacher_target_speedup_band: tuple[float, float] = (0.0, 0.0)
+    teacher_mutation_instruction: str = ""
+    solver_trace_summary: str = ""
 
 
 @dataclass(frozen=True)
@@ -69,6 +74,14 @@ class CapabilityProfile:
     fast_1_rate: float
     failure_rate: float
     sample_count: int
+    zone: str = "unknown"
+    utility_score: float = 0.0
+    normalized_utility: float = 0.0
+    mean_best_speedup: float = 0.0
+    mean_runtime_us: float = 0.0
+    mastered_task_rate: float = 0.0
+    learning_task_rate: float = 0.0
+    too_hard_task_rate: float = 0.0
 
 
 @dataclass(frozen=True)
