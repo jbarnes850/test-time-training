@@ -71,7 +71,7 @@ def _process_sample_result(result, renderer):
 
 def _eval_single(args: Tuple) -> Tuple[int, float, bool, float, float]:
     """Evaluate single kernel (for parallel execution)."""
-    problem_id, idx, raw_action, kernel_code, action_log_path = args
+    problem_id, idx, raw_action, kernel_code, action_log_path, level = args
     if action_log_path:
         with action_log_path.open("a") as handle:
             handle.write(json.dumps({
@@ -80,19 +80,19 @@ def _eval_single(args: Tuple) -> Tuple[int, float, bool, float, float]:
                 "raw_action": raw_action,
                 "assembled_code": kernel_code,
             }) + "\n")
-    result = evaluate_kernel(problem_id, kernel_code)
+    result = evaluate_kernel(problem_id, kernel_code, level=level)
     reward = compute_reward(result.speedup, result.correctness)
     runtime = result.runtime_us if result.runtime_us > 0 else 0.0
     return idx, reward, result.correctness, result.speedup, runtime
 
 
-def _evaluate_messages(problem_id, ref_code, messages, action_log_path, max_workers: int = 4):
+def _evaluate_messages(problem_id, ref_code, messages, action_log_path, max_workers: int = 4, level: int = 1):
     """Evaluate messages in parallel."""
     eval_tasks = []
     for idx, msg in enumerate(messages):
         raw_action = extract_python_code(get_text_content(msg))
         kernel_code = assemble_modelnew_code(raw_action, ref_code)
-        eval_tasks.append((problem_id, idx, raw_action, kernel_code, action_log_path))
+        eval_tasks.append((problem_id, idx, raw_action, kernel_code, action_log_path, level))
 
     results = [None] * len(messages)
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
@@ -122,6 +122,7 @@ def main() -> int:
     parser.add_argument("--eval_mode", type=str, default="full", choices=["full", "fast"])
     parser.add_argument("--num_correct_trials", type=int, default=None)
     parser.add_argument("--num_perf_trials", type=int, default=None)
+    parser.add_argument("--level", type=int, default=1, help="KernelBench level (1, 2, or 3)")
     parser.add_argument("--eval_workers", type=int, default=4, help="Parallel kernel eval workers")
     parser.add_argument("--prefetch", type=int, default=2, help="Tasks to prefetch samples for")
     args = parser.parse_args()
@@ -162,7 +163,7 @@ def main() -> int:
     # Prepare all tasks
     tasks_data = []
     for pid in problem_ids:
-        task = load_task(pid)
+        task = load_task(pid, level=args.level)
         msgs = build_messages(task)
         prompt = renderer.build_generation_prompt(msgs)
         tasks_data.append({"problem_id": pid, "task": task, "prompt": prompt})
@@ -208,7 +209,7 @@ def main() -> int:
         messages_G, token_counts = _process_sample_result(result, renderer)
         rewards, correct, speedups, runtimes = _evaluate_messages(
             problem_id, td["task"].reference_code, messages_G, action_log_path,
-            max_workers=args.eval_workers
+            max_workers=args.eval_workers, level=args.level
         )
         sample_fast1 = fast_1(correct, speedups)
         best_speedup = 0.0
