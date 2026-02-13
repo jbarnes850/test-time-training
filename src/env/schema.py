@@ -53,6 +53,8 @@ class MutatedTask:
     mutation_prompt_hash: str
     novelty_hash: str
     epoch_created: int
+    mutation_type: str = "unspecified"
+    optimization_prompt: str = ""
 
 
 @dataclass(frozen=True)

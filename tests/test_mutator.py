@@ -2,7 +2,13 @@ from pathlib import Path
 
 import pytest
 
-from src.env.mutator import ApiMutatorBackend, KernelMutator, MutationValidationResult
+from src.env.mutator import (
+    ALLOWED_MUTATION_TYPES,
+    ApiMutatorBackend,
+    KernelMutator,
+    MutationValidationResult,
+    parse_mutation_response,
+)
 from src.env.replay_buffer import ReplayBuffer
 from src.env.schema import EvalResult, KernelTask, ReplayEntry
 
@@ -27,6 +33,13 @@ class Model(nn.Module):
         return y + 1
 """
 
+VALID_MUTATION_RESPONSE = f"""```python
+{VALID_MUTATION}
+```
+MUTATION_TYPE: logic_restructuring
+OPTIMIZATION_PROMPT: Improve dataflow and fusion opportunities while preserving semantics.
+"""
+
 
 class DummyBackend:
     def __init__(self, outputs: list[str]):
@@ -41,7 +54,7 @@ class DummyBackend:
     def model_id(self) -> str:
         return "dummy/model"
 
-    def generate_mutation(self, seed_task, prompt, *, temperature, max_tokens) -> str:
+    def generate_mutation(self, seed_task, prompt, *, system_prompt, temperature, max_tokens) -> str:
         idx = min(self.calls, len(self.outputs) - 1)
         self.calls += 1
         return self.outputs[idx]
@@ -110,6 +123,16 @@ class Model(nn.Module):
     assert result.stage == "interface"
 
 
+def test_validate_mutation_structural_identity(tmp_path: Path):
+    replay = ReplayBuffer(tmp_path / "replay.jsonl")
+    backend = DummyBackend([""])
+    mutator = KernelMutator(backend, replay)
+
+    result = mutator.validate_mutation(_seed_task(), SEED_CODE)
+    assert result.valid is False
+    assert result.stage == "structural"
+
+
 def test_validate_mutation_novelty_collision(tmp_path: Path):
     replay = ReplayBuffer(tmp_path / "replay.jsonl")
     _append_existing_mutation(replay, VALID_MUTATION)
@@ -123,7 +146,7 @@ def test_validate_mutation_novelty_collision(tmp_path: Path):
 
 def test_mutate_returns_mutated_task_with_lineage(tmp_path: Path):
     replay = ReplayBuffer(tmp_path / "replay.jsonl")
-    backend = DummyBackend(["def broken(:", VALID_MUTATION])
+    backend = DummyBackend(["bad response", VALID_MUTATION_RESPONSE])
     mutator = KernelMutator(backend, replay, max_retries=3)
 
     mutated = mutator.mutate(_seed_task(), epoch=2)
@@ -131,21 +154,46 @@ def test_mutate_returns_mutated_task_with_lineage(tmp_path: Path):
     assert mutated.seed_problem_id == 4
     assert mutated.mutation_backend == "dummy"
     assert mutated.mutation_model_id == "dummy/model"
+    assert mutated.mutation_type in ALLOWED_MUTATION_TYPES
+    assert mutated.optimization_prompt
     assert "activation" in mutated.category_tags
     assert mutated.category_id in {"activation", "composite:activation+reduction"}
+    assert mutator.stats.attempts_total == 2
+    assert mutator.stats.accepted == 1
+    assert mutator.stats.format_failures == 1
 
 
 def test_mutate_returns_none_when_retries_exhausted(tmp_path: Path):
     replay = ReplayBuffer(tmp_path / "replay.jsonl")
-    backend = DummyBackend(["def broken(:"])
+    backend = DummyBackend(["invalid output"])
     mutator = KernelMutator(backend, replay, max_retries=2)
 
     mutated = mutator.mutate(_seed_task(), epoch=3)
     assert mutated is None
     assert backend.calls == 2
+    assert mutator.stats.format_failures == 2
+
+
+def test_parse_mutation_response_success():
+    proposal = parse_mutation_response(VALID_MUTATION_RESPONSE)
+    assert proposal is not None
+    assert proposal.code.strip().startswith("import torch")
+    assert proposal.mutation_type == "logic_restructuring"
+    assert proposal.optimization_prompt.startswith("Improve")
+
+
+def test_parse_mutation_response_missing_fields():
+    proposal = parse_mutation_response("```python\nprint('x')\n```")
+    assert proposal is None
 
 
 def test_api_backend_is_stub():
     backend = ApiMutatorBackend(model_id="provider/model")
     with pytest.raises(NotImplementedError):
-        backend.generate_mutation(_seed_task(), "prompt", temperature=0.2, max_tokens=64)
+        backend.generate_mutation(
+            _seed_task(),
+            "prompt",
+            system_prompt="system",
+            temperature=0.2,
+            max_tokens=64,
+        )
