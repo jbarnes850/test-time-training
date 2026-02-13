@@ -81,6 +81,11 @@ def test_adaptive_train_dry_run_writes_required_artifacts(tmp_path: Path, monkey
     assert summary
     assert summary[0]["epoch"] == 0
 
+    run_config = json.loads((run_dir / "run_config.json").read_text())
+    assert run_config["resolved_solver_backend"] == "dry_run"
+    assert run_config["resolved_solver_metadata"]["backend"] == "dry_run"
+    assert run_config["resolved_mutator_backend"] == "dry_run"
+
 
 def test_adaptive_train_resume(tmp_path: Path, monkeypatch):
     split_train = tmp_path / "split_train.json"

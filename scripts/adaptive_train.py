@@ -6,23 +6,26 @@ import json
 import os
 import statistics
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Any, Protocol
+from typing import Any
 
-from src.env.evaluator import EvalResult, compute_reward, evaluate_kernel
+from src.env.evaluator import EvalResult
 from src.env.mutator import ApiMutatorBackend, KernelMutator, TinkerMutatorBackend
 from src.env.replay_buffer import ReplayBuffer
 from src.env.schema import CapabilityProfile, KernelTask, ReplayEntry
-from src.env.tasking import build_messages, load_task
+from src.env.solver import (
+    DryRunSolverBackend,
+    SolveOutcome,
+    SolverBackend,
+    SolverBackendConfig,
+    TinkerSolverBackend,
+)
+from src.env.tasking import load_task
 from src.env.teacher import CurriculumTeacher, category_id, infer_task_categories
-from src.rlvr_utils import build_datums_from_group
 from src.utils.checkpoint_utils import load_latest_checkpoint
-from src.utils.code_utils import assemble_modelnew_code, extract_python_code
 from src.utils.env_utils import load_dotenv
 from src.utils.path_utils import repo_root
-from src.utils.tinker_utils import ensure_tinker_cookbook_on_path
 
 load_dotenv()
 
@@ -111,43 +114,6 @@ class TaskHandle:
     category_id: str
 
 
-@dataclass
-class SolveOutcome:
-    prompt: Any
-    sampled_tokens: list[list[int]]
-    sampled_logprobs: list[list[float]]
-    raw_actions: list[str]
-    kernel_codes: list[str]
-    eval_results: list[EvalResult]
-    rewards: list[float]
-    wall_clock_s: float
-
-
-class Solver(Protocol):
-    sampler_path: str
-    backend_name: str
-
-    def solve_task(
-        self,
-        task: KernelTask,
-        *,
-        k: int,
-        temperature: float,
-        max_tokens: int,
-        level: int,
-        eval_workers: int,
-    ) -> SolveOutcome:
-        ...
-
-    def train_on_outcomes(
-        self,
-        outcomes: list[SolveOutcome],
-        *,
-        epoch: int,
-    ) -> str:
-        ...
-
-
 class DryRunMutatorBackend:
     @property
     def backend_name(self) -> str:
@@ -166,197 +132,6 @@ class DryRunMutatorBackend:
         max_tokens: int,
     ) -> str:
         return seed_task.reference_code
-
-
-class DryRunSolver:
-    def __init__(self, sampler_path: str = "dry_run/sampler"):
-        self.sampler_path = sampler_path
-        self.backend_name = "dry_run"
-
-    def solve_task(
-        self,
-        task: KernelTask,
-        *,
-        k: int,
-        temperature: float,
-        max_tokens: int,
-        level: int,
-        eval_workers: int,
-    ) -> SolveOutcome:
-        start = time.time()
-        raw_actions = []
-        kernel_codes = []
-        eval_results = []
-        rewards = []
-        for idx in range(k):
-            raw_action = "return x"
-            speedup = 1.0 + (((task.problem_id + idx) % 4) * 0.1)
-            result = EvalResult(
-                compiled=True,
-                correctness=True,
-                runtime_us=1.0,
-                ref_runtime_us=speedup,
-                speedup=speedup,
-                metadata={},
-            )
-            reward = compute_reward(result.speedup, result.correctness)
-            raw_actions.append(raw_action)
-            kernel_codes.append(raw_action)
-            eval_results.append(result)
-            rewards.append(reward)
-        return SolveOutcome(
-            prompt=None,
-            sampled_tokens=[],
-            sampled_logprobs=[],
-            raw_actions=raw_actions,
-            kernel_codes=kernel_codes,
-            eval_results=eval_results,
-            rewards=rewards,
-            wall_clock_s=time.time() - start,
-        )
-
-    def train_on_outcomes(self, outcomes: list[SolveOutcome], *, epoch: int) -> str:
-        self.sampler_path = f"dry_run/sampler/epoch_{epoch}"
-        return self.sampler_path
-
-
-class TinkerSolver:
-    def __init__(
-        self,
-        *,
-        model: str,
-        sampler_path: str,
-        renderer_name: str,
-        training_enabled: bool,
-        training_state_path: str,
-        lora_rank: int,
-        learning_rate: float,
-    ):
-        import tinker
-
-        ensure_tinker_cookbook_on_path()
-        from tinker_cookbook.renderers import get_renderer, get_text_content
-        from tinker_cookbook.tokenizer_utils import get_tokenizer
-
-        if not sampler_path:
-            raise ValueError("Solver sampler path must be provided for non-dry runs.")
-        if training_enabled and sampler_path and not training_state_path:
-            raise ValueError(
-                "Training requires a Tinker training state path. "
-                "Provide --training_state_path or a checkpoint_jsonl with state_path."
-            )
-
-        self._tinker = tinker
-        self._get_text_content = get_text_content
-        self.backend_name = "tinker"
-        self.sampler_path = sampler_path
-        self.learning_rate = learning_rate
-        self.training_enabled = training_enabled
-
-        self._service_client = tinker.ServiceClient()
-        self._sampling_client = self._service_client.create_sampling_client(model_path=sampler_path)
-        tokenizer = get_tokenizer(model)
-        self._renderer = get_renderer(renderer_name, tokenizer)
-        self._training_client = None
-        if training_enabled:
-            self._training_client = self._service_client.create_training_client_from_state(training_state_path)
-
-    def solve_task(
-        self,
-        task: KernelTask,
-        *,
-        k: int,
-        temperature: float,
-        max_tokens: int,
-        level: int,
-        eval_workers: int,
-    ) -> SolveOutcome:
-        start = time.time()
-        messages = build_messages(task)
-        prompt = self._renderer.build_generation_prompt(messages)
-        future = self._sampling_client.sample(
-            prompt=prompt,
-            num_samples=k,
-            sampling_params=self._tinker.SamplingParams(
-                max_tokens=max_tokens,
-                stop=self._renderer.get_stop_sequences(),
-                temperature=temperature,
-            ),
-        )
-        result = future.result()
-        sampled_tokens = [list(seq.tokens) for seq in result.sequences]
-        sampled_logprobs = [
-            [float(lp) if lp is not None else 0.0 for lp in seq.logprobs]
-            for seq in result.sequences
-        ]
-        raw_actions = []
-        kernel_codes = []
-        for seq in result.sequences:
-            parsed_message, _ = self._renderer.parse_response(seq.tokens)
-            raw_action = extract_python_code(self._get_text_content(parsed_message))
-            kernel_code = assemble_modelnew_code(raw_action, task.reference_code)
-            raw_actions.append(raw_action)
-            kernel_codes.append(kernel_code)
-
-        eval_results: list[EvalResult] = [None] * len(kernel_codes)  # type: ignore[assignment]
-        with ThreadPoolExecutor(max_workers=max(1, eval_workers)) as executor:
-            futures = {
-                executor.submit(evaluate_kernel, task.problem_id, code, level): idx
-                for idx, code in enumerate(kernel_codes)
-            }
-            for future in as_completed(futures):
-                idx = futures[future]
-                eval_results[idx] = future.result()
-
-        rewards = [compute_reward(r.speedup, r.correctness) for r in eval_results]
-        return SolveOutcome(
-            prompt=prompt,
-            sampled_tokens=sampled_tokens,
-            sampled_logprobs=sampled_logprobs,
-            raw_actions=raw_actions,
-            kernel_codes=kernel_codes,
-            eval_results=eval_results,
-            rewards=rewards,
-            wall_clock_s=time.time() - start,
-        )
-
-    def train_on_outcomes(
-        self,
-        outcomes: list[SolveOutcome],
-        *,
-        epoch: int,
-    ) -> str:
-        if not self.training_enabled or self._training_client is None:
-            return self.sampler_path
-
-        all_datums = []
-        for outcome in outcomes:
-            if outcome.prompt is None:
-                continue
-            if not outcome.sampled_tokens or not outcome.sampled_logprobs:
-                continue
-            mean_reward = statistics.mean(outcome.rewards) if outcome.rewards else 0.0
-            advantages = [r - mean_reward for r in outcome.rewards]
-            datums = build_datums_from_group(
-                outcome.prompt,
-                outcome.sampled_tokens,
-                outcome.sampled_logprobs,
-                advantages,
-            )
-            all_datums.extend(datums)
-
-        if not all_datums:
-            return self.sampler_path
-
-        fwd_bwd = self._training_client.forward_backward(all_datums, loss_fn="importance_sampling")
-        optim = self._training_client.optim_step(self._tinker.AdamParams(learning_rate=self.learning_rate))
-        _ = fwd_bwd.result()
-        _ = optim.result()
-        self.sampler_path = self._training_client.save_weights_for_sampler(
-            name=f"adaptive_epoch_{epoch}"
-        ).result().path
-        self._sampling_client = self._service_client.create_sampling_client(model_path=self.sampler_path)
-        return self.sampler_path
 
 
 def _load_problem_ids(
@@ -406,7 +181,7 @@ def _resolve_log_dir(log_path: str) -> Path:
 
 
 def _profile_solver(
-    solver: Solver,
+    solver: SolverBackend,
     eval_tasks: list[TaskHandle],
     *,
     profile_k: int,
@@ -488,8 +263,8 @@ def _budget_cap(args: argparse.Namespace) -> float:
 
 
 def _load_solver_paths(args: argparse.Namespace) -> tuple[str, str]:
-    sampler_path = args.sampler_path
-    state_path = args.training_state_path
+    sampler_path = args.solver_sampler_path or args.sampler_path
+    state_path = args.solver_training_state_path or args.training_state_path
     if args.checkpoint_jsonl:
         ckpt = load_latest_checkpoint(args.checkpoint_jsonl)
         if ckpt:
@@ -518,6 +293,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max_tokens", type=int, default=1024)
     parser.add_argument("--level_train", type=int, default=1)
     parser.add_argument("--level_eval", type=int, default=2)
+    parser.add_argument("--solver_backend", type=str, default="tinker", choices=["tinker", "dry_run"])
+    parser.add_argument("--solver_model_id", type=str, default="")
+    parser.add_argument("--solver_sampler_path", type=str, default="")
+    parser.add_argument("--solver_renderer_name", type=str, default="")
+    parser.add_argument("--solver_training_state_path", type=str, default="")
     parser.add_argument("--model", type=str, default="openai/gpt-oss-120b")
     parser.add_argument("--sampler_path", type=str, default="")
     parser.add_argument("--checkpoint_jsonl", type=str, default="")
@@ -551,7 +331,12 @@ def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     if args.eval_workers < 1:
         raise ValueError("--eval_workers must be >= 1")
-    if not args.dry_run and not os.environ.get("TINKER_API_KEY"):
+    solver_backend_name = "dry_run" if args.dry_run else args.solver_backend
+    needs_tinker_api = (
+        solver_backend_name == "tinker"
+        or (not args.dry_run and args.mutator_backend == "tinker")
+    )
+    if needs_tinker_api and not os.environ.get("TINKER_API_KEY"):
         raise RuntimeError("TINKER_API_KEY not set.")
 
     run_dir = _resolve_log_dir(args.resume_from or args.log_path)
@@ -563,7 +348,6 @@ def main(argv: list[str] | None = None) -> int:
     capability_profiles_path = run_dir / "capability_profiles.jsonl"
     replay_path = run_dir / "replay_entries.jsonl"
 
-    _write_json(run_config_path, vars(args))
     replay_buffer = ReplayBuffer(replay_path)
     teacher = CurriculumTeacher(seed=args.seed)
     cost_tracker = _load_cost_tracker(cost_tracker_path, args.gpu_hour_rate)
@@ -584,23 +368,36 @@ def main(argv: list[str] | None = None) -> int:
     eval_tasks = _prepare_task_handles(eval_ids, level=args.level_eval)
 
     sampler_path, training_state_path = _load_solver_paths(args)
-    if args.dry_run:
-        solver: Solver = DryRunSolver(sampler_path or "dry_run/sampler")
+    solver_model_id = args.solver_model_id or args.model
+    solver_renderer_name = args.solver_renderer_name or args.renderer_name
+    if solver_backend_name == "dry_run":
+        solver: SolverBackend = DryRunSolverBackend(sampler_path or "dry_run/sampler")
         mutator_backend = DryRunMutatorBackend()
     else:
-        solver = TinkerSolver(
-            model=args.model,
+        solver_config = SolverBackendConfig(
+            backend=solver_backend_name,
+            model_id=solver_model_id,
             sampler_path=sampler_path,
-            renderer_name=args.renderer_name,
+            renderer_name=solver_renderer_name,
             training_enabled=args.enable_training,
             training_state_path=training_state_path,
             lora_rank=args.lora_rank,
             learning_rate=args.learning_rate,
         )
+        solver = TinkerSolverBackend(config=solver_config)
         if args.mutator_backend == "tinker":
             mutator_backend = TinkerMutatorBackend(model_id=args.mutator_model_path)
         else:
             mutator_backend = ApiMutatorBackend(model_id=args.mutator_model_path)
+
+    run_config = dict(vars(args))
+    run_config["resolved_solver_backend"] = solver_backend_name
+    run_config["resolved_solver_model_id"] = solver.model_id
+    run_config["resolved_solver_sampler_path"] = solver.sampler_path
+    run_config["resolved_solver_metadata"] = solver.metadata()
+    run_config["resolved_mutator_backend"] = mutator_backend.backend_name
+    run_config["resolved_mutator_model_id"] = mutator_backend.model_id
+    _write_json(run_config_path, run_config)
 
     mutator = KernelMutator(
         mutator_backend,
