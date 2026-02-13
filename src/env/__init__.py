@@ -18,7 +18,15 @@ from src.env.solver import (
     TinkerSolverBackend,
 )
 from src.env.telemetry import TelemetryRecord, build_record, validate_telemetry
-from src.env.teacher import CurriculumTeacher, category_id, infer_task_categories
+from src.env.teacher import (
+    CurriculumTeacher,
+    HeuristicTeacherBackend,
+    TeacherDecision,
+    TeacherPolicyBackend,
+    TinkerLLMTeacherBackend,
+    category_id,
+    infer_task_categories,
+)
 from src.env.mutator import (
     ApiMutatorBackend,
     KernelMutator,

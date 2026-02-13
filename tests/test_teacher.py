@@ -1,4 +1,9 @@
-from src.env.teacher import CurriculumTeacher, category_id, infer_task_categories
+from src.env.teacher import (
+    CurriculumTeacher,
+    HeuristicTeacherBackend,
+    category_id,
+    infer_task_categories,
+)
 
 
 def test_infer_task_categories_composite():
@@ -96,3 +101,45 @@ def test_rank_tasks_easy_to_hard_prefers_high_correctness_first():
     ]
     ranked = teacher.rank_tasks(tasks, strategy="easy_to_hard_static")
     assert ranked[0]["category_id"] == "conv"
+
+
+def test_heuristic_teacher_selects_in_band_frontier_target():
+    backend = HeuristicTeacherBackend()
+    teacher = CurriculumTeacher(
+        seed=9,
+        policy_backend=backend,
+        target_min_completion=0.25,
+        target_max_completion=0.75,
+    )
+    rows = [
+        {"task_id": "a", "category_id": "conv", "correctness": True, "speedup": 1.2},
+        {"task_id": "b", "category_id": "conv", "correctness": True, "speedup": 1.1},
+        {"task_id": "c", "category_id": "matmul", "correctness": False, "speedup": 0.0},
+        {"task_id": "d", "category_id": "matmul", "correctness": True, "speedup": 1.4},
+        {"task_id": "e", "category_id": "pooling", "correctness": False, "speedup": 0.0},
+    ]
+    teacher.update_profile(rows, epoch=1)
+    decision = teacher.select_frontier_target()
+    assert decision.target_category == "matmul"
+    assert decision.backend == "heuristic"
+    assert decision.hard_frontier is False
+
+
+def test_heuristic_teacher_marks_hard_frontier_when_below_band():
+    backend = HeuristicTeacherBackend()
+    teacher = CurriculumTeacher(
+        seed=9,
+        policy_backend=backend,
+        target_min_completion=0.25,
+        target_max_completion=0.75,
+    )
+    rows = [
+        {"task_id": "a", "category_id": "conv", "correctness": True, "speedup": 1.2},
+        {"task_id": "b", "category_id": "conv", "correctness": True, "speedup": 1.1},
+        {"task_id": "c", "category_id": "matmul", "correctness": False, "speedup": 0.0},
+        {"task_id": "d", "category_id": "matmul", "correctness": False, "speedup": 0.0},
+    ]
+    teacher.update_profile(rows, epoch=1)
+    decision = teacher.select_frontier_target()
+    assert decision.target_category == "matmul"
+    assert decision.hard_frontier is True

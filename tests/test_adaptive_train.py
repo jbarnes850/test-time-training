@@ -1,5 +1,6 @@
 import json
 from pathlib import Path
+from types import SimpleNamespace
 
 import scripts.adaptive_train as adaptive_train
 from src.env.schema import KernelTask
@@ -167,3 +168,32 @@ def test_budget_projection_halts_before_epoch(tmp_path: Path, monkeypatch):
     rows = [json.loads(line) for line in (run_dir / "epoch_summary.jsonl").read_text().splitlines()]
     assert rows
     assert rows[0]["status"] == "halted_budget_projection"
+
+
+def test_allocate_level_counts_sums_to_total():
+    counts = adaptive_train._allocate_level_counts(20, [0.25, 0.45, 0.2, 0.1])
+    assert sum(counts) == 20
+    assert counts == [5, 9, 4, 2]
+
+
+def test_build_mixed_train_handles_uses_available_levels(monkeypatch):
+    monkeypatch.setattr(adaptive_train, "available_kernelbench_levels", lambda: (1, 2, 3, 4))
+
+    def _fake_level(level: int):
+        return [{"problem_id": i} for i in range(1, 11)]
+
+    monkeypatch.setattr(adaptive_train, "load_kernelbench_level", _fake_level)
+    monkeypatch.setattr(adaptive_train, "load_task", _fake_task)
+
+    args = SimpleNamespace(
+        seed_levels="1,2,5",
+        seed_mix="0.25,0.45,0.30",
+        max_train_tasks=10,
+        seed=42,
+        train_subset="train",
+        seed_split_paths="",
+    )
+    handles = adaptive_train._build_mixed_train_handles(args)
+    assert len(handles) == 10
+    levels = {h.level for h in handles}
+    assert levels == {1, 2}

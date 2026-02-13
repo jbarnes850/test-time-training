@@ -4,6 +4,7 @@ import argparse
 import hashlib
 import json
 import os
+import random
 import statistics
 import time
 from dataclasses import asdict, dataclass, field
@@ -22,8 +23,15 @@ from src.env.solver import (
     TinkerSolverBackend,
 )
 from src.env.tasking import load_task
-from src.env.teacher import CurriculumTeacher, category_id, infer_task_categories
+from src.env.teacher import (
+    CurriculumTeacher,
+    HeuristicTeacherBackend,
+    TinkerLLMTeacherBackend,
+    category_id,
+    infer_task_categories,
+)
 from src.utils.checkpoint_utils import load_latest_checkpoint
+from src.utils.dataset_utils import available_kernelbench_levels, load_kernelbench_level
 from src.utils.env_utils import load_dotenv
 from src.utils.path_utils import repo_root
 
@@ -110,6 +118,7 @@ class CostTracker:
 @dataclass(frozen=True)
 class TaskHandle:
     task: KernelTask
+    level: int
     category_tags: tuple[str, ...]
     category_id: str
 
@@ -150,13 +159,154 @@ def _load_problem_ids(
     return ids
 
 
+def _parse_int_csv(text: str) -> list[int]:
+    return [int(x.strip()) for x in text.split(",") if x.strip()]
+
+
+def _parse_float_csv(text: str) -> list[float]:
+    return [float(x.strip()) for x in text.split(",") if x.strip()]
+
+
+def _parse_level_split_map(text: str) -> dict[int, str]:
+    result: dict[int, str] = {}
+    if not text.strip():
+        return result
+    for item in text.split(","):
+        piece = item.strip()
+        if not piece:
+            continue
+        if ":" not in piece:
+            raise ValueError(
+                f"Invalid level split mapping '{piece}'. Expected format '<level>:<path>'."
+            )
+        raw_level, raw_path = piece.split(":", 1)
+        level = int(raw_level.strip())
+        path = raw_path.strip()
+        if not path:
+            raise ValueError(f"Empty split path for level {level}.")
+        result[level] = path
+    return result
+
+
+def _default_split_path_for_level(level: int, seed: int) -> Path:
+    return repo_root() / "splits" / f"l{level}_seed{seed}.json"
+
+
+def _resolve_level_problem_ids(
+    *,
+    level: int,
+    subset: str,
+    seed: int,
+    split_path: str | None,
+) -> list[int]:
+    if split_path:
+        split_file = Path(split_path)
+        if not split_file.is_absolute():
+            split_file = repo_root() / split_file
+        if split_file.exists():
+            return _load_problem_ids(
+                str(split_file),
+                split_name=subset,
+                max_tasks=None,
+                problem_ids=None,
+            )
+
+    default_split = _default_split_path_for_level(level, seed)
+    if default_split.exists():
+        return _load_problem_ids(
+            str(default_split),
+            split_name=subset,
+            max_tasks=None,
+            problem_ids=None,
+        )
+
+    ds = load_kernelbench_level(level)
+    ids = [int(row["problem_id"]) for row in ds]
+    rng = random.Random(seed + (level * 1009))
+    rng.shuffle(ids)
+    cutoff = int(len(ids) * 0.8)
+    if subset == "train":
+        return ids[:cutoff]
+    if subset == "eval":
+        return ids[cutoff:]
+    raise ValueError(f"Unknown subset: {subset}")
+
+
+def _allocate_level_counts(total: int, weights: list[float]) -> list[int]:
+    if total <= 0:
+        return [0 for _ in weights]
+    if not weights:
+        raise ValueError("weights must be non-empty")
+    if any(w < 0 for w in weights):
+        raise ValueError("weights must be non-negative")
+    s = sum(weights)
+    if s <= 0:
+        raise ValueError("weights must sum to > 0")
+    normalized = [w / s for w in weights]
+    raw = [total * w for w in normalized]
+    counts = [int(x) for x in raw]
+    remainder = total - sum(counts)
+    fractional_order = sorted(
+        range(len(weights)),
+        key=lambda i: (raw[i] - counts[i], -i),
+        reverse=True,
+    )
+    for i in range(remainder):
+        counts[fractional_order[i % len(counts)]] += 1
+    return counts
+
+
 def _prepare_task_handles(problem_ids: list[int], level: int) -> list[TaskHandle]:
     handles: list[TaskHandle] = []
     for pid in problem_ids:
         task = load_task(pid, level=level)
         tags = tuple(sorted(infer_task_categories(task.reference_code)))
-        handles.append(TaskHandle(task=task, category_tags=tags, category_id=category_id(set(tags))))
+        handles.append(
+            TaskHandle(
+                task=task,
+                level=level,
+                category_tags=tags,
+                category_id=category_id(set(tags)),
+            )
+        )
     return handles
+
+
+def _build_mixed_train_handles(args: argparse.Namespace) -> list[TaskHandle]:
+    levels = _parse_int_csv(args.seed_levels)
+    weights = _parse_float_csv(args.seed_mix)
+    if len(levels) != len(weights):
+        raise ValueError("seed_levels and seed_mix must have the same length.")
+    available_levels = set(available_kernelbench_levels())
+    requested_pairs = [(lvl, wt) for lvl, wt in zip(levels, weights) if lvl in available_levels]
+    if not requested_pairs:
+        raise ValueError(
+            f"None of requested seed levels are available. "
+            f"requested={levels}, available={sorted(available_levels)}"
+        )
+    levels = [lvl for lvl, _ in requested_pairs]
+    weights = [wt for _, wt in requested_pairs]
+    counts = _allocate_level_counts(args.max_train_tasks, weights)
+    level_split_map = _parse_level_split_map(args.seed_split_paths)
+
+    train_handles: list[TaskHandle] = []
+    for level, n_samples in zip(levels, counts):
+        if n_samples <= 0:
+            continue
+        candidate_ids = _resolve_level_problem_ids(
+            level=level,
+            subset=args.train_subset,
+            seed=args.seed,
+            split_path=level_split_map.get(level),
+        )
+        if not candidate_ids:
+            continue
+        rng = random.Random(args.seed + (level * 9973))
+        candidate_ids = list(candidate_ids)
+        rng.shuffle(candidate_ids)
+        selected_ids = candidate_ids[:n_samples]
+        train_handles.extend(_prepare_task_handles(selected_ids, level=level))
+    return train_handles
 
 
 def _write_json(path: Path, payload: dict[str, Any]) -> None:
@@ -188,7 +338,6 @@ def _profile_solver(
     profile_k: int,
     temperature: float,
     max_tokens: int,
-    level: int,
     eval_workers: int,
 ) -> tuple[list[dict[str, Any]], float]:
     rows: list[dict[str, Any]] = []
@@ -199,7 +348,7 @@ def _profile_solver(
             k=profile_k,
             temperature=temperature,
             max_tokens=max_tokens,
-            level=level,
+            level=handle.level,
             eval_workers=eval_workers,
         )
         total_wall += outcome.wall_clock_s
@@ -219,16 +368,20 @@ def _profile_solver(
 
 def _select_seed_task(
     *,
-    teacher: CurriculumTeacher,
     replay_buffer: ReplayBuffer,
     ranked_train_tasks: list[TaskHandle],
     profiles: list[CapabilityProfile],
     replay_recency_window: int,
-) -> tuple[KernelTask, str, int, str]:
-    weak_categories = [
-        p.category_id
-        for p in sorted(profiles, key=lambda p: p.correctness_rate)
-    ]
+    preferred_category: str,
+) -> tuple[KernelTask, str, int, str, int]:
+    weak_categories = [preferred_category]
+    weak_categories.extend(
+        [
+            p.category_id
+            for p in sorted(profiles, key=lambda p: p.correctness_rate)
+            if p.category_id != preferred_category
+        ]
+    )
     for cat in weak_categories:
         replay_seed = replay_buffer.select_seed(
             {
@@ -244,7 +397,14 @@ def _select_seed_task(
                 name=f"replay_seed_{replay_seed.task_id}",
                 reference_code=replay_seed.task_reference_code,
             )
-            return seed_task, replay_seed.task_id, int(replay_seed.problem_id), replay_seed.category_id
+            replay_level = int(replay_seed.level) if replay_seed.level is not None else 1
+            return (
+                seed_task,
+                replay_seed.task_id,
+                int(replay_seed.problem_id),
+                replay_seed.category_id,
+                replay_level,
+            )
 
     if not ranked_train_tasks:
         raise RuntimeError("No training tasks available for seed selection.")
@@ -254,6 +414,7 @@ def _select_seed_task(
         f"seed_{fallback.task.problem_id}",
         fallback.task.problem_id,
         fallback.category_id,
+        fallback.level,
     )
 
 
@@ -282,6 +443,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--split_eval", type=str, default="splits/l2_seed42.json")
     parser.add_argument("--train_subset", type=str, default="train")
     parser.add_argument("--eval_subset", type=str, default="eval")
+    parser.add_argument("--seed_use_mixed_pool", action="store_true")
+    parser.add_argument("--seed_levels", type=str, default="1,2,3,4,5")
+    parser.add_argument("--seed_mix", type=str, default="0.25,0.45,0.20,0.10,0.00")
+    parser.add_argument("--seed_split_paths", type=str, default="")
     parser.add_argument("--train_problem_ids", type=str, default="")
     parser.add_argument("--eval_problem_ids", type=str, default="")
     parser.add_argument("--max_train_tasks", type=int, default=80)
@@ -308,10 +473,17 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--learning_rate", type=float, default=1e-5)
     parser.add_argument("--renderer_name", type=str, default="gpt_oss_no_sysprompt")
     parser.add_argument("--mutator_backend", type=str, default="tinker", choices=["tinker", "api_stub"])
-    parser.add_argument("--mutator_model_path", type=str, default="moonshotai/Kimi-K2.5")
+    parser.add_argument("--mutator_model_path", type=str, default="Qwen/Qwen3-30B-A3B-Instruct-2507")
+    parser.add_argument(
+        "--mutator_frontier_model_path",
+        type=str,
+        default="Qwen/Qwen3-235B-A22B-Instruct-2507",
+    )
     parser.add_argument("--mutator_renderer_name", type=str, default="")
     parser.add_argument("--mutator_request_timeout_s", type=float, default=180.0)
-    parser.add_argument("--mutator_max_retries", type=int, default=3)
+    parser.add_argument("--mutator_primary_retries", type=int, default=1)
+    parser.add_argument("--mutator_frontier_retries", type=int, default=2)
+    parser.add_argument("--mutator_max_retries", type=int, default=3)  # backward-compatible cap
     parser.add_argument(
         "--mutator_semantic_filter",
         type=str,
@@ -320,7 +492,20 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--mutator_semantic_correct_trials", type=int, default=1)
     parser.add_argument("--mutator_semantic_perf_trials", type=int, default=1)
-    parser.add_argument("--teacher_strategy", type=str, default="inverse_correctness")
+    parser.add_argument(
+        "--teacher_strategy",
+        type=str,
+        default="frontier_band",
+        choices=["frontier_band", "inverse_correctness", "loss_proportional", "easy_to_hard_static", "random"],
+    )
+    parser.add_argument("--teacher_backend", type=str, default="tinker", choices=["heuristic", "tinker"])
+    parser.add_argument("--teacher_model_id", type=str, default="Qwen/Qwen3-30B-A3B-Instruct-2507")
+    parser.add_argument("--teacher_renderer_name", type=str, default="")
+    parser.add_argument("--teacher_request_timeout_s", type=float, default=45.0)
+    parser.add_argument("--teacher_temperature", type=float, default=0.1)
+    parser.add_argument("--teacher_max_tokens", type=int, default=384)
+    parser.add_argument("--learnability_low", type=float, default=0.25)
+    parser.add_argument("--learnability_high", type=float, default=0.75)
     parser.add_argument("--replay_recency_window", type=int, default=200)
     parser.add_argument("--log_path", type=str, default="runs/adaptive_phase1")
     parser.add_argument("--resume_from", type=str, default="")
@@ -332,6 +517,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--mutate_api_usd_per_task", type=float, default=0.15)
     parser.add_argument("--solve_api_usd_per_task", type=float, default=0.5)
     parser.add_argument("--train_api_usd_per_epoch", type=float, default=5.0)
+    parser.add_argument("--teacher_api_usd_per_epoch", type=float, default=0.2)
     parser.add_argument("--eval_workers", type=int, default=1)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--dry_run", action="store_true")
@@ -342,10 +528,15 @@ def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     if args.eval_workers < 1:
         raise ValueError("--eval_workers must be >= 1")
+    if not (0.0 <= args.learnability_low < args.learnability_high <= 1.0):
+        raise ValueError("--learnability_low/--learnability_high must satisfy 0 <= low < high <= 1.")
+
     solver_backend_name = "dry_run" if args.dry_run else args.solver_backend
+    teacher_backend_name = "heuristic" if args.dry_run else args.teacher_backend
     needs_tinker_api = (
         solver_backend_name == "tinker"
         or (not args.dry_run and args.mutator_backend == "tinker")
+        or teacher_backend_name == "tinker"
     )
     if needs_tinker_api and not os.environ.get("TINKER_API_KEY"):
         raise RuntimeError("TINKER_API_KEY not set.")
@@ -361,30 +552,53 @@ def main(argv: list[str] | None = None) -> int:
     mutator_stats_path = run_dir / "mutator_stats.jsonl"
 
     replay_buffer = ReplayBuffer(replay_path)
-    teacher = CurriculumTeacher(seed=args.seed)
+    if teacher_backend_name == "tinker":
+        teacher_backend = TinkerLLMTeacherBackend(
+            model_id=args.teacher_model_id,
+            renderer_name=args.teacher_renderer_name or None,
+            temperature=args.teacher_temperature,
+            max_tokens=args.teacher_max_tokens,
+            request_timeout_s=args.teacher_request_timeout_s,
+            fallback_backend=HeuristicTeacherBackend(),
+        )
+    else:
+        teacher_backend = HeuristicTeacherBackend()
+    teacher = CurriculumTeacher(
+        seed=args.seed,
+        policy_backend=teacher_backend,
+        target_min_completion=args.learnability_low,
+        target_max_completion=args.learnability_high,
+    )
     cost_tracker = _load_cost_tracker(cost_tracker_path, args.gpu_hour_rate)
 
-    train_ids = _load_problem_ids(
-        args.split_train,
-        args.train_subset,
-        args.max_train_tasks,
-        args.train_problem_ids or None,
-    )
+    if args.seed_use_mixed_pool:
+        train_tasks = _build_mixed_train_handles(args)
+    else:
+        train_ids = _load_problem_ids(
+            args.split_train,
+            args.train_subset,
+            args.max_train_tasks,
+            args.train_problem_ids or None,
+        )
+        train_tasks = _prepare_task_handles(train_ids, level=args.level_train)
+
     eval_ids = _load_problem_ids(
         args.split_eval,
         args.eval_subset,
         args.max_eval_tasks,
         args.eval_problem_ids or None,
     )
-    train_tasks = _prepare_task_handles(train_ids, level=args.level_train)
     eval_tasks = _prepare_task_handles(eval_ids, level=args.level_eval)
+    if not train_tasks:
+        raise RuntimeError("No training tasks resolved. Check seed level mix and split configuration.")
 
     sampler_path, training_state_path = _load_solver_paths(args)
     solver_model_id = args.solver_model_id or args.model
     solver_renderer_name = args.solver_renderer_name or args.renderer_name
     if solver_backend_name == "dry_run":
         solver: SolverBackend = DryRunSolverBackend(sampler_path or "dry_run/sampler")
-        mutator_backend = DryRunMutatorBackend()
+        mutator_backend_primary = DryRunMutatorBackend()
+        mutator_backend_frontier = DryRunMutatorBackend()
     else:
         solver_config = SolverBackendConfig(
             backend=solver_backend_name,
@@ -398,27 +612,52 @@ def main(argv: list[str] | None = None) -> int:
         )
         solver = TinkerSolverBackend(config=solver_config)
         if args.mutator_backend == "tinker":
-            mutator_backend = TinkerMutatorBackend(
+            mutator_backend_primary = TinkerMutatorBackend(
                 model_id=args.mutator_model_path,
                 renderer_name=args.mutator_renderer_name or None,
                 request_timeout_s=args.mutator_request_timeout_s,
             )
+            mutator_backend_frontier = TinkerMutatorBackend(
+                model_id=args.mutator_frontier_model_path or args.mutator_model_path,
+                renderer_name=args.mutator_renderer_name or None,
+                request_timeout_s=args.mutator_request_timeout_s,
+            )
         else:
-            mutator_backend = ApiMutatorBackend(model_id=args.mutator_model_path)
+            mutator_backend_primary = ApiMutatorBackend(model_id=args.mutator_model_path)
+            mutator_backend_frontier = ApiMutatorBackend(
+                model_id=args.mutator_frontier_model_path or args.mutator_model_path
+            )
 
     run_config = dict(vars(args))
     run_config["resolved_solver_backend"] = solver_backend_name
     run_config["resolved_solver_model_id"] = solver.model_id
     run_config["resolved_solver_sampler_path"] = solver.sampler_path
     run_config["resolved_solver_metadata"] = solver.metadata()
-    run_config["resolved_mutator_backend"] = mutator_backend.backend_name
-    run_config["resolved_mutator_model_id"] = mutator_backend.model_id
+    run_config["resolved_teacher_backend"] = teacher_backend.backend_name
+    run_config["resolved_teacher_model_id"] = teacher_backend.model_id
+    run_config["resolved_mutator_backend"] = mutator_backend_primary.backend_name
+    run_config["resolved_mutator_model_id"] = mutator_backend_primary.model_id
+    run_config["resolved_mutator_frontier_model_id"] = mutator_backend_frontier.model_id
+    run_config["resolved_train_level_counts"] = {
+        str(level): sum(1 for h in train_tasks if h.level == level)
+        for level in sorted({h.level for h in train_tasks})
+    }
     _write_json(run_config_path, run_config)
 
-    mutator = KernelMutator(
-        mutator_backend,
+    mutator_primary = KernelMutator(
+        mutator_backend_primary,
         replay_buffer,
-        max_retries=args.mutator_max_retries,
+        max_retries=max(1, min(args.mutator_primary_retries, args.mutator_max_retries)),
+        temperature=args.temperature,
+        max_tokens=args.max_tokens,
+        semantic_filter=args.mutator_semantic_filter,
+        semantic_correct_trials=args.mutator_semantic_correct_trials,
+        semantic_perf_trials=args.mutator_semantic_perf_trials,
+    )
+    mutator_frontier = KernelMutator(
+        mutator_backend_frontier,
+        replay_buffer,
+        max_retries=max(1, min(args.mutator_frontier_retries, args.mutator_max_retries)),
         temperature=args.temperature,
         max_tokens=args.max_tokens,
         semantic_filter=args.mutator_semantic_filter,
@@ -437,7 +676,8 @@ def main(argv: list[str] | None = None) -> int:
     start_epoch = next_epoch
 
     for epoch in range(start_epoch, args.epochs):
-        mutator.reset_stats()
+        mutator_primary.reset_stats()
+        mutator_frontier.reset_stats()
         remaining_epochs = args.epochs - epoch
         projected_total = cost_tracker.projected_total(
             remaining_epochs=remaining_epochs,
@@ -465,7 +705,6 @@ def main(argv: list[str] | None = None) -> int:
             profile_k=args.profile_k,
             temperature=args.temperature,
             max_tokens=args.max_tokens,
-            level=args.level_eval,
             eval_workers=args.eval_workers,
         )
         cost_tracker.add_cost(
@@ -477,17 +716,27 @@ def main(argv: list[str] | None = None) -> int:
         profiles = teacher.update_profile(profile_rows, epoch=epoch, split=args.eval_subset)
         for profile in profiles:
             _append_jsonl(capability_profiles_path, asdict(profile))
+        teacher_decision = teacher.select_frontier_target(
+            target_min_completion=args.learnability_low,
+            target_max_completion=args.learnability_high,
+        )
+        if teacher_backend_name == "tinker":
+            cost_tracker.add_cost(
+                "teacher",
+                api_usd=0.0 if args.dry_run else args.teacher_api_usd_per_epoch,
+                epoch=epoch,
+            )
 
         ranked_train_tasks = teacher.rank_tasks(train_tasks, strategy=args.teacher_strategy)
         solve_outcomes: list[SolveOutcome] = []
 
         for _ in range(min(args.tasks_per_epoch, len(ranked_train_tasks))):
-            seed_task, parent_task_id, seed_problem_id, seed_category = _select_seed_task(
-                teacher=teacher,
+            seed_task, parent_task_id, seed_problem_id, seed_category, seed_level = _select_seed_task(
                 replay_buffer=replay_buffer,
                 ranked_train_tasks=ranked_train_tasks,
                 profiles=profiles,
                 replay_recency_window=args.replay_recency_window,
+                preferred_category=teacher_decision.target_category,
             )
             cost_tracker.add_cost(
                 "mutate",
@@ -495,13 +744,38 @@ def main(argv: list[str] | None = None) -> int:
                 epoch=epoch,
             )
             mutator_target_category = seed_category
-            mutated = mutator.mutate(
-                seed_task,
-                epoch=epoch,
-                seed_problem_id=seed_problem_id,
-                target_category=mutator_target_category,
-                level=args.level_train,
-            )
+            if teacher_decision.hard_frontier:
+                mutated = mutator_frontier.mutate(
+                    seed_task,
+                    epoch=epoch,
+                    seed_problem_id=seed_problem_id,
+                    target_category=mutator_target_category,
+                    level=seed_level,
+                )
+                if mutated is None:
+                    mutated = mutator_primary.mutate(
+                        seed_task,
+                        epoch=epoch,
+                        seed_problem_id=seed_problem_id,
+                        target_category=mutator_target_category,
+                        level=seed_level,
+                    )
+            else:
+                mutated = mutator_primary.mutate(
+                    seed_task,
+                    epoch=epoch,
+                    seed_problem_id=seed_problem_id,
+                    target_category=mutator_target_category,
+                    level=seed_level,
+                )
+                if mutated is None:
+                    mutated = mutator_frontier.mutate(
+                        seed_task,
+                        epoch=epoch,
+                        seed_problem_id=seed_problem_id,
+                        target_category=mutator_target_category,
+                        level=seed_level,
+                    )
             if mutated is None:
                 bank_eval = EvalResult(
                     compiled=False,
@@ -516,7 +790,7 @@ def main(argv: list[str] | None = None) -> int:
                     task_id=f"bank_{seed_problem_id}_{epoch}",
                     parent_task_id=parent_task_id,
                     problem_id=seed_problem_id,
-                    level=args.level_train,
+                    level=seed_level,
                     category_id=seed_category,
                     task_reference_code=seed_task.reference_code,
                     kernel_code="",
@@ -541,7 +815,7 @@ def main(argv: list[str] | None = None) -> int:
                 k=args.k,
                 temperature=args.temperature,
                 max_tokens=args.max_tokens,
-                level=args.level_train,
+                level=seed_level,
                 eval_workers=args.eval_workers,
             )
             solve_outcomes.append(solve_outcome)
@@ -561,7 +835,7 @@ def main(argv: list[str] | None = None) -> int:
                     task_id=mutated.task_id,
                     parent_task_id=parent_task_id,
                     problem_id=seed_problem_id,
-                    level=args.level_train,
+                    level=seed_level,
                     category_id=mutated.category_id,
                     task_reference_code=mutated.reference_code,
                     kernel_code=kernel_code,
@@ -599,7 +873,8 @@ def main(argv: list[str] | None = None) -> int:
             mutator_stats_path,
             {
                 "epoch": epoch,
-                **mutator.stats.as_dict(),
+                "primary": mutator_primary.stats.as_dict(),
+                "frontier": mutator_frontier.stats.as_dict(),
             },
         )
         _append_jsonl(
@@ -612,7 +887,11 @@ def main(argv: list[str] | None = None) -> int:
                 "epoch_cost_usd": epoch_cost,
                 "running_total_usd": cost_tracker.total_usd,
                 "sampler_path": solver.sampler_path,
-                "mutator_stats": mutator.stats.as_dict(),
+                "teacher_decision": asdict(teacher_decision),
+                "mutator_stats": {
+                    "primary": mutator_primary.stats.as_dict(),
+                    "frontier": mutator_frontier.stats.as_dict(),
+                },
             },
         )
 
