@@ -36,6 +36,7 @@ from src.env.teacher import (
 from src.utils.checkpoint_utils import load_latest_checkpoint
 from src.utils.dataset_utils import available_kernelbench_levels, load_kernelbench_level
 from src.utils.env_utils import load_dotenv
+from src.utils.feedback_utils import extract_error_info
 from src.utils.path_utils import repo_root
 
 load_dotenv()
@@ -94,6 +95,7 @@ EXPERIMENT_ARM_POLICY = {
 
 PRIMARY_MATCHED_COMPUTE_ARMS = ("B0", "B1", "B2", "C")
 PAPER_BASE_MODEL_ID = "openai/gpt-oss-120b"
+TEACHER_DEFAULT_MODEL_ID = "Qwen/Qwen3-235B-A22B-Instruct-2507"
 
 
 @dataclass
@@ -550,6 +552,139 @@ def _profile_solver(
     return rows, total_wall
 
 
+def _zone_failure_speedup_ceiling(zone: str) -> float:
+    if zone == ZONE_TOO_HARD:
+        return 1.10
+    if zone == ZONE_LEARNING:
+        return 1.80
+    if zone == ZONE_MASTERED:
+        return 2.20
+    return 1.50
+
+
+def _select_failure_exemplars(
+    replay_buffer: ReplayBuffer,
+    *,
+    category_id: str,
+    zone: str,
+    recency_window: int,
+    limit: int,
+) -> list[dict[str, Any]]:
+    rows = replay_buffer.query(
+        category_id=category_id,
+        recency_window=recency_window,
+        limit=max(limit * 10, 40),
+    )
+    if not rows:
+        return []
+
+    speed_ceiling = _zone_failure_speedup_ceiling(zone)
+    ranked: list[tuple[float, dict[str, Any]]] = []
+    for entry in rows:
+        correctness = bool(entry.eval_result.correctness)
+        compiled = bool(entry.eval_result.compiled)
+        speedup = float(entry.eval_result.speedup)
+        error_message, _ = extract_error_info(entry.eval_result.metadata)
+        is_failure = (not correctness) or (speedup <= speed_ceiling)
+        if not is_failure:
+            continue
+        severity = 0.0
+        if not correctness:
+            severity += 3.0
+        if not compiled:
+            severity += 1.0
+        severity += max(0.0, speed_ceiling - speedup)
+        # Slight recency preference via epoch.
+        severity += max(0.0, float(entry.epoch) * 1e-3)
+        ranked.append(
+            (
+                severity,
+                {
+                    "entry_id": entry.entry_id,
+                    "task_id": entry.task_id,
+                    "problem_id": entry.problem_id,
+                    "category_id": entry.category_id,
+                    "zone": zone,
+                    "compiled": compiled,
+                    "correctness": correctness,
+                    "speedup": speedup,
+                    "reward": float(entry.reward),
+                    "error_message": error_message,
+                    "epoch": int(entry.epoch),
+                    "timestamp": float(entry.timestamp),
+                },
+            )
+        )
+    ranked.sort(key=lambda x: x[0], reverse=True)
+    return [payload for _, payload in ranked[: max(0, limit)]]
+
+
+def _build_teacher_failure_context(
+    replay_buffer: ReplayBuffer,
+    profiles: list[CapabilityProfile],
+    *,
+    recency_window: int,
+    per_zone_limit: int,
+) -> list[dict[str, Any]]:
+    by_zone: dict[str, list[CapabilityProfile]] = {
+        ZONE_LEARNING: [],
+        ZONE_TOO_HARD: [],
+        ZONE_MASTERED: [],
+    }
+    for profile in profiles:
+        if profile.zone in by_zone:
+            by_zone[profile.zone].append(profile)
+    for zone in by_zone:
+        by_zone[zone] = sorted(
+            by_zone[zone],
+            key=lambda p: (-p.normalized_utility, -p.utility_score, p.category_id),
+        )
+
+    exemplars: list[dict[str, Any]] = []
+    for zone in (ZONE_LEARNING, ZONE_TOO_HARD, ZONE_MASTERED):
+        zone_profiles = by_zone.get(zone, [])
+        if not zone_profiles:
+            continue
+        # Pull failures from strongest frontier categories first.
+        for profile in zone_profiles[:3]:
+            rows = _select_failure_exemplars(
+                replay_buffer,
+                category_id=profile.category_id,
+                zone=zone,
+                recency_window=recency_window,
+                limit=per_zone_limit,
+            )
+            exemplars.extend(rows)
+            if len([e for e in exemplars if e.get("zone") == zone]) >= per_zone_limit:
+                break
+    exemplars.sort(
+        key=lambda e: (
+            str(e.get("zone", "")),
+            not bool(e.get("correctness", False)),
+            float(e.get("speedup", 0.0)),
+            -float(e.get("timestamp", 0.0)),
+        )
+    )
+    return exemplars[: max(0, per_zone_limit * 3)]
+
+
+def _next_probe_tasks(
+    eval_tasks: list[TaskHandle],
+    *,
+    cursor: int,
+    probe_tasks: int,
+) -> tuple[list[TaskHandle], int]:
+    if not eval_tasks or probe_tasks <= 0:
+        return [], cursor
+    count = min(len(eval_tasks), probe_tasks)
+    picked: list[TaskHandle] = []
+    curr = cursor
+    for _ in range(count):
+        picked.append(eval_tasks[curr % len(eval_tasks)])
+        curr += 1
+    return picked, curr % len(eval_tasks)
+
+
 def _gradient_signal_summary(
     outcomes: list[SolveOutcome],
     *,
@@ -680,6 +815,7 @@ def _apply_experiment_arm_defaults(args: argparse.Namespace) -> tuple[str, dict[
     if arm == "B1":
         _set_arm_default(args, "model", PAPER_BASE_MODEL_ID, applied)
         _set_arm_default(args, "solver_model_id", "", applied)
+        _set_arm_default(args, "teacher_model_id", TEACHER_DEFAULT_MODEL_ID, applied)
         _set_arm_default(args, "teacher_strategy", "random", applied)
         _set_arm_default(args, "curriculum_controller", "fixed", applied)
         _set_arm_default(args, "seed_use_mixed_pool", True, applied)
@@ -687,6 +823,7 @@ def _apply_experiment_arm_defaults(args: argparse.Namespace) -> tuple[str, dict[
     elif arm == "B2":
         _set_arm_default(args, "model", PAPER_BASE_MODEL_ID, applied)
         _set_arm_default(args, "solver_model_id", "", applied)
+        _set_arm_default(args, "teacher_model_id", TEACHER_DEFAULT_MODEL_ID, applied)
         _set_arm_default(args, "teacher_strategy", "easy_to_hard_static", applied)
         _set_arm_default(args, "curriculum_controller", "fixed", applied)
         _set_arm_default(args, "seed_use_mixed_pool", True, applied)
@@ -694,6 +831,7 @@ def _apply_experiment_arm_defaults(args: argparse.Namespace) -> tuple[str, dict[
     elif arm == "C":
         _set_arm_default(args, "model", PAPER_BASE_MODEL_ID, applied)
         _set_arm_default(args, "solver_model_id", "", applied)
+        _set_arm_default(args, "teacher_model_id", TEACHER_DEFAULT_MODEL_ID, applied)
         _set_arm_default(args, "teacher_strategy", "frontier_band", applied)
         _set_arm_default(args, "curriculum_controller", "adaptive", applied)
         _set_arm_default(args, "seed_use_mixed_pool", True, applied)
@@ -701,6 +839,7 @@ def _apply_experiment_arm_defaults(args: argparse.Namespace) -> tuple[str, dict[
     elif arm == "B0":
         _set_arm_default(args, "model", PAPER_BASE_MODEL_ID, applied)
         _set_arm_default(args, "solver_model_id", "", applied)
+        _set_arm_default(args, "teacher_model_id", TEACHER_DEFAULT_MODEL_ID, applied)
         _set_arm_default(args, "teacher_strategy", "frontier_band", applied)
         _set_arm_default(args, "curriculum_controller", "adaptive", applied)
         _set_arm_default(args, "seed_use_mixed_pool", True, applied)
@@ -712,6 +851,7 @@ def _apply_experiment_arm_defaults(args: argparse.Namespace) -> tuple[str, dict[
     elif arm == "B3":
         _set_arm_default(args, "model", PAPER_BASE_MODEL_ID, applied)
         _set_arm_default(args, "solver_model_id", "", applied)
+        _set_arm_default(args, "teacher_model_id", TEACHER_DEFAULT_MODEL_ID, applied)
         _set_arm_default(args, "curriculum_controller", "fixed", applied)
         _set_arm_default(args, "enable_training", False, applied)
         _set_arm_default(args, "tasks_per_epoch", 0, applied)
@@ -792,11 +932,13 @@ def build_parser() -> argparse.ArgumentParser:
         choices=["frontier_band", "inverse_correctness", "loss_proportional", "easy_to_hard_static", "random"],
     )
     parser.add_argument("--teacher_backend", type=str, default="tinker", choices=["heuristic", "tinker"])
-    parser.add_argument("--teacher_model_id", type=str, default="Qwen/Qwen3-235B-A22B-Instruct-2507")
+    parser.add_argument("--teacher_model_id", type=str, default=TEACHER_DEFAULT_MODEL_ID)
     parser.add_argument("--teacher_renderer_name", type=str, default="")
     parser.add_argument("--teacher_request_timeout_s", type=float, default=45.0)
     parser.add_argument("--teacher_temperature", type=float, default=0.1)
     parser.add_argument("--teacher_max_tokens", type=int, default=384)
+    parser.add_argument("--teacher_failure_exemplars_per_zone", type=int, default=3)
+    parser.add_argument("--teacher_seed_failure_exemplars", type=int, default=4)
     parser.add_argument("--learnability_low", type=float, default=0.25)
     parser.add_argument("--learnability_high", type=float, default=0.75)
     parser.add_argument("--curriculum_mastered_quota", type=float, default=0.15)
@@ -818,11 +960,16 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--gpu_hour_rate", type=float, default=1.20)
     parser.add_argument("--default_epoch_cost_usd", type=float, default=40.0)
     parser.add_argument("--profile_api_usd_per_epoch", type=float, default=2.0)
+    parser.add_argument("--mini_profile_api_usd_per_probe", type=float, default=0.5)
     parser.add_argument("--mutate_api_usd_per_task", type=float, default=0.15)
     parser.add_argument("--solve_api_usd_per_task", type=float, default=0.5)
     parser.add_argument("--train_api_usd_per_epoch", type=float, default=5.0)
     parser.add_argument("--teacher_api_usd_per_epoch", type=float, default=0.2)
+    parser.add_argument("--teacher_api_usd_per_seed_directive", type=float, default=0.03)
     parser.add_argument("--eval_workers", type=int, default=1)
+    parser.add_argument("--mini_reprofile_every", type=int, default=4)
+    parser.add_argument("--mini_reprofile_probe_tasks", type=int, default=6)
+    parser.add_argument("--mini_reprofile_k", type=int, default=1)
     parser.add_argument("--effective_task_std_threshold", type=float, default=1e-5)
     parser.add_argument("--min_effective_tasks", type=int, default=4)
     parser.add_argument("--min_effective_tasks_patience", type=int, default=2)
@@ -837,6 +984,16 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.eval_workers < 1:
         raise ValueError("--eval_workers must be >= 1")
+    if args.teacher_failure_exemplars_per_zone < 0:
+        raise ValueError("--teacher_failure_exemplars_per_zone must be >= 0")
+    if args.teacher_seed_failure_exemplars < 0:
+        raise ValueError("--teacher_seed_failure_exemplars must be >= 0")
+    if args.mini_reprofile_every < 0:
+        raise ValueError("--mini_reprofile_every must be >= 0")
+    if args.mini_reprofile_probe_tasks < 0:
+        raise ValueError("--mini_reprofile_probe_tasks must be >= 0")
+    if args.mini_reprofile_k < 1:
+        raise ValueError("--mini_reprofile_k must be >= 1")
     if args.min_effective_tasks < 0:
         raise ValueError("--min_effective_tasks must be >= 0")
     if args.min_effective_tasks_patience < 1:
@@ -1029,6 +1186,9 @@ def main(argv: list[str] | None = None) -> int:
     for epoch in range(start_epoch, args.epochs):
         mutator_primary.reset_stats()
         mutator_frontier.reset_stats()
+        probe_pool = list(eval_tasks)
+        random.Random(args.seed + (epoch * 4049)).shuffle(probe_pool)
+        probe_cursor = 0
         remaining_epochs = args.epochs - epoch
         projected_total = cost_tracker.projected_total(
             remaining_epochs=remaining_epochs,
@@ -1068,9 +1228,16 @@ def main(argv: list[str] | None = None) -> int:
         profiles = teacher.update_profile(profile_rows, epoch=epoch, split=args.eval_subset)
         for profile in profiles:
             _append_jsonl(capability_profiles_path, asdict(profile))
+        teacher_failure_context = _build_teacher_failure_context(
+            replay_buffer,
+            profiles,
+            recency_window=args.replay_recency_window,
+            per_zone_limit=args.teacher_failure_exemplars_per_zone,
+        )
         teacher_decision = teacher.select_frontier_target(
             target_min_completion=args.learnability_low,
             target_max_completion=args.learnability_high,
+            failure_exemplars=teacher_failure_context,
         )
         if teacher_backend_name == "tinker":
             cost_tracker.add_cost(
@@ -1115,8 +1282,12 @@ def main(argv: list[str] | None = None) -> int:
         realized_zone_counts = {ZONE_MASTERED: 0, ZONE_LEARNING: 0, ZONE_TOO_HARD: 0}
 
         solve_outcomes: list[SolveOutcome] = []
+        slot_idx = 0
+        mini_reprofile_events = 0
 
-        for slot_zone in zone_plan:
+        while slot_idx < slot_count:
+            slot_zone = zone_plan[slot_idx] if slot_idx < len(zone_plan) else ZONE_LEARNING
+            slot_idx += 1
             slot_profile = _pick_category_for_zone(
                 profiles_by_zone,
                 slot_zone,
@@ -1183,6 +1354,32 @@ def main(argv: list[str] | None = None) -> int:
                 if preferred_profile is not None
                 else f"category={seed_category} no_profile"
             )
+            seed_failure_exemplars = _select_failure_exemplars(
+                replay_buffer,
+                category_id=seed_category,
+                zone=effective_zone,
+                recency_window=args.replay_recency_window,
+                limit=args.teacher_seed_failure_exemplars,
+            )
+            seed_plan = teacher.plan_seed_mutation(
+                seed_task=seed_task,
+                target_category=seed_category,
+                zone=effective_zone,
+                target_speedup_band=target_speedup_band,
+                solver_trace_summary=solver_trace_summary,
+                failure_exemplars=seed_failure_exemplars,
+            )
+            decision_mode = seed_plan.decision_mode or decision_mode
+            reason_code = seed_plan.reason_code or reason_code
+            target_speedup_band = seed_plan.target_speedup_band or target_speedup_band
+            mutation_instruction = seed_plan.mutation_instruction or mutation_instruction
+            teacher_seed_rationale = seed_plan.rationale
+            if teacher_backend_name == "tinker":
+                cost_tracker.add_cost(
+                    "teacher_seed_directive",
+                    api_usd=0.0 if args.dry_run else args.teacher_api_usd_per_seed_directive,
+                    epoch=epoch,
+                )
             cost_tracker.add_cost(
                 "mutate",
                 api_usd=0.0 if args.dry_run else args.mutate_api_usd_per_task,
@@ -1200,10 +1397,12 @@ def main(argv: list[str] | None = None) -> int:
                     target_category=mutator_target_category,
                     level=seed_level,
                     target_speedup_band=target_speedup_band,
+                    failure_exemplars=seed_failure_exemplars,
                     solver_trace_summary=solver_trace_summary,
                     mutation_instruction=mutation_instruction,
                     decision_mode=decision_mode,
                     reason_code=reason_code,
+                    teacher_seed_rationale=teacher_seed_rationale,
                 )
                 if mutated is None:
                     mutated = mutator_primary.mutate(
@@ -1213,10 +1412,12 @@ def main(argv: list[str] | None = None) -> int:
                         target_category=mutator_target_category,
                         level=seed_level,
                         target_speedup_band=target_speedup_band,
+                        failure_exemplars=seed_failure_exemplars,
                         solver_trace_summary=solver_trace_summary,
                         mutation_instruction=mutation_instruction,
                         decision_mode=decision_mode,
                         reason_code=reason_code,
+                        teacher_seed_rationale=teacher_seed_rationale,
                     )
             else:
                 mutated = mutator_primary.mutate(
@@ -1226,10 +1427,12 @@ def main(argv: list[str] | None = None) -> int:
                     target_category=mutator_target_category,
                     level=seed_level,
                     target_speedup_band=target_speedup_band,
+                    failure_exemplars=seed_failure_exemplars,
                     solver_trace_summary=solver_trace_summary,
                     mutation_instruction=mutation_instruction,
                     decision_mode=decision_mode,
                     reason_code=reason_code,
+                    teacher_seed_rationale=teacher_seed_rationale,
                 )
                 if mutated is None:
                     mutated = mutator_frontier.mutate(
@@ -1239,10 +1442,12 @@ def main(argv: list[str] | None = None) -> int:
                         target_category=mutator_target_category,
                         level=seed_level,
                         target_speedup_band=target_speedup_band,
+                        failure_exemplars=seed_failure_exemplars,
                         solver_trace_summary=solver_trace_summary,
                         mutation_instruction=mutation_instruction,
                         decision_mode=decision_mode,
                         reason_code=reason_code,
+                        teacher_seed_rationale=teacher_seed_rationale,
                     )
             if mutated is None:
                 _append_jsonl(
@@ -1259,6 +1464,11 @@ def main(argv: list[str] | None = None) -> int:
                         "target_speedup_band": list(target_speedup_band),
                         "mutation_instruction": mutation_instruction,
                         "solver_trace_summary": solver_trace_summary,
+                        "teacher_seed_rationale": teacher_seed_rationale,
+                        "failure_exemplar_ids": [
+                            str(row.get("entry_id", "")) for row in seed_failure_exemplars
+                        ],
+                        "failure_exemplar_count": len(seed_failure_exemplars),
                     },
                 )
                 bank_eval = EvalResult(
@@ -1305,6 +1515,9 @@ def main(argv: list[str] | None = None) -> int:
                     "target_speedup_band": list(mutated.teacher_target_speedup_band),
                     "mutation_instruction": mutated.teacher_mutation_instruction,
                     "solver_trace_summary": mutated.solver_trace_summary,
+                    "teacher_seed_rationale": mutated.teacher_seed_rationale,
+                    "failure_exemplar_ids": list(mutated.teacher_failure_entry_ids),
+                    "failure_exemplar_count": len(mutated.teacher_failure_entry_ids),
                     "mutation_type": mutated.mutation_type,
                     "mutation_backend": mutated.mutation_backend,
                     "mutation_model_id": mutated.mutation_model_id,
@@ -1358,6 +1571,92 @@ def main(argv: list[str] | None = None) -> int:
                 if eval_result.correctness and eval_result.speedup > 1.0:
                     successful_records += 1
 
+            should_mini_reprofile = (
+                args.mini_reprofile_every > 0
+                and slot_idx < slot_count
+                and (slot_idx % args.mini_reprofile_every == 0)
+            )
+            if should_mini_reprofile:
+                probe_tasks, probe_cursor = _next_probe_tasks(
+                    probe_pool,
+                    cursor=probe_cursor,
+                    probe_tasks=args.mini_reprofile_probe_tasks,
+                )
+                if probe_tasks:
+                    mini_rows, mini_wall = _profile_solver(
+                        solver,
+                        probe_tasks,
+                        profile_k=args.mini_reprofile_k,
+                        temperature=args.temperature,
+                        max_tokens=args.max_tokens,
+                        eval_workers=args.eval_workers,
+                    )
+                    profile_rows.extend(mini_rows)
+                    cost_tracker.add_cost(
+                        "mini_profile",
+                        gpu_hours=mini_wall / 3600.0,
+                        api_usd=0.0 if args.dry_run else args.mini_profile_api_usd_per_probe,
+                        epoch=epoch,
+                    )
+                    profiles = teacher.update_profile(
+                        profile_rows,
+                        epoch=epoch,
+                        split=f"{args.eval_subset}_rolling",
+                    )
+                    for profile in profiles:
+                        _append_jsonl(capability_profiles_path, asdict(profile))
+                    teacher_failure_context = _build_teacher_failure_context(
+                        replay_buffer,
+                        profiles,
+                        recency_window=args.replay_recency_window,
+                        per_zone_limit=args.teacher_failure_exemplars_per_zone,
+                    )
+                    teacher_decision = teacher.select_frontier_target(
+                        target_min_completion=args.learnability_low,
+                        target_max_completion=args.learnability_high,
+                        failure_exemplars=teacher_failure_context,
+                    )
+                    if teacher_backend_name == "tinker":
+                        cost_tracker.add_cost(
+                            "teacher",
+                            api_usd=0.0 if args.dry_run else args.teacher_api_usd_per_epoch,
+                            epoch=epoch,
+                        )
+                    ranked_train_tasks = teacher.rank_tasks(
+                        train_tasks,
+                        strategy=args.teacher_strategy,
+                    )
+                    profiles_by_zone = teacher.profiles_by_zone()
+                    observed_zone_counts = _zone_counts_from_profiles(profiles)
+                    if args.curriculum_controller == "adaptive":
+                        adjusted_quotas, quota_adjustment = _adaptive_zone_quotas(
+                            base_quotas,
+                            observed_zone_counts,
+                            target_learning_share=args.curriculum_target_learning_share,
+                            max_adjustment=args.curriculum_max_adjustment,
+                        )
+                        quota_adjustment["controller"] = "adaptive"
+                    else:
+                        adjusted_quotas = dict(base_quotas)
+                        total = sum(observed_zone_counts.values())
+                        learning_share = (
+                            observed_zone_counts.get(ZONE_LEARNING, 0.0) / total if total > 0 else 0.0
+                        )
+                        quota_adjustment = {
+                            "controller": "fixed",
+                            "learning_share": learning_share,
+                            "delta_learning": 0.0,
+                        }
+                    desired_zone_counts = _allocate_zone_counts(slot_count, adjusted_quotas)
+                    remaining_slots = slot_count - slot_idx
+                    if remaining_slots > 0:
+                        remaining_zone_counts = _allocate_zone_counts(remaining_slots, adjusted_quotas)
+                        remaining_plan = _build_zone_plan(remaining_zone_counts)
+                        if len(remaining_plan) < remaining_slots:
+                            remaining_plan.extend([ZONE_LEARNING] * (remaining_slots - len(remaining_plan)))
+                        zone_plan = zone_plan[:slot_idx] + remaining_plan[:remaining_slots]
+                    mini_reprofile_events += 1
+
         if args.enable_training:
             solver.sampler_path = solver.train_on_outcomes(solve_outcomes, epoch=epoch)
             cost_tracker.add_cost(
@@ -1409,6 +1708,7 @@ def main(argv: list[str] | None = None) -> int:
             "required_effective_tasks": required_effective_tasks,
             "signal_task_rate": signal_stats["effective_task_rate"],
             "low_signal_streak": low_signal_streak,
+            "mini_reprofile_events": mini_reprofile_events,
         }
         _append_jsonl(kpi_dashboard_path, kpi_payload)
         prev_frontier_size = frontier_size
@@ -1455,6 +1755,8 @@ def main(argv: list[str] | None = None) -> int:
                         zone: (count / max(1, sum(realized_zone_counts.values())))
                         for zone, count in realized_zone_counts.items()
                     },
+                    "teacher_failure_context_count": len(teacher_failure_context),
+                    "mini_reprofile_events": mini_reprofile_events,
                 },
                 "gradient_signal": {
                     "effective_tasks": effective_tasks,

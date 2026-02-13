@@ -96,6 +96,7 @@ def test_adaptive_train_dry_run_writes_required_artifacts(tmp_path: Path, monkey
     assert "reason_code" in mutation_events[0]
     assert "target_speedup_band" in mutation_events[0]
     assert "mutation_instruction" in mutation_events[0]
+    assert "failure_exemplar_count" in mutation_events[0]
 
     run_config = json.loads((run_dir / "run_config.json").read_text())
     assert run_config["resolved_experiment_arm"] == "custom"
@@ -109,6 +110,7 @@ def test_adaptive_train_dry_run_writes_required_artifacts(tmp_path: Path, monkey
     assert "effective_tasks" in summary[0]["gradient_signal"]
     assert "zero_signal_tasks" in summary[0]["gradient_signal"]
     assert "controller" in summary[0]["curriculum"]
+    assert "teacher_failure_context_count" in summary[0]["curriculum"]
 
 
 def test_adaptive_train_resume(tmp_path: Path, monkeypatch):
@@ -202,6 +204,7 @@ def test_apply_experiment_arm_defaults_b0_clears_sampler_init():
         experiment_arm="B0",
         model="Qwen/Qwen3-30B-A3B-Instruct-2507",
         solver_model_id="Qwen/Qwen3-30B-A3B-Instruct-2507",
+        teacher_model_id="Qwen/Qwen3-30B-A3B-Instruct-2507",
         teacher_strategy="inverse_correctness",
         curriculum_controller="fixed",
         seed_use_mixed_pool=False,
@@ -216,6 +219,7 @@ def test_apply_experiment_arm_defaults_b0_clears_sampler_init():
     assert resolved == "B0"
     assert args.model == adaptive_train.PAPER_BASE_MODEL_ID
     assert args.solver_model_id == ""
+    assert args.teacher_model_id == adaptive_train.TEACHER_DEFAULT_MODEL_ID
     assert args.curriculum_controller == "adaptive"
     assert args.seed_use_mixed_pool is True
     assert args.seed_pool_mode == "uniform_levels"
@@ -331,10 +335,12 @@ def test_low_gradient_signal_gate_halts_run(tmp_path: Path, monkeypatch):
         target_category,
         level,
         target_speedup_band,
+        failure_exemplars,
         solver_trace_summary,
         mutation_instruction,
         decision_mode,
         reason_code,
+        teacher_seed_rationale,
     ):
         counter["i"] += 1
         return MutatedTask(
@@ -358,6 +364,10 @@ def test_low_gradient_signal_gate_halts_run(tmp_path: Path, monkeypatch):
             teacher_target_speedup_band=target_speedup_band,
             teacher_mutation_instruction=mutation_instruction,
             solver_trace_summary=solver_trace_summary,
+            teacher_failure_entry_ids=tuple(
+                str(row.get("entry_id", "")) for row in (failure_exemplars or [])
+            ),
+            teacher_seed_rationale=teacher_seed_rationale or "",
         )
 
     monkeypatch.setattr(adaptive_train.KernelMutator, "mutate", _fake_mutate)
@@ -393,6 +403,96 @@ def test_low_gradient_signal_gate_halts_run(tmp_path: Path, monkeypatch):
     epoch_row = next(row for row in rows if row.get("epoch") == 0 and "gradient_signal" in row)
     assert epoch_row["gradient_signal"]["effective_tasks"] == 0
     assert epoch_row["gradient_signal"]["required_effective_tasks"] == 1
+
+
+def test_mini_reprofile_refreshes_profiles_and_logs_events(tmp_path: Path, monkeypatch):
+    split_train = tmp_path / "split_train.json"
+    split_eval = tmp_path / "split_eval.json"
+    _write_split(split_train)
+    _write_split(split_eval)
+    monkeypatch.setattr(adaptive_train, "load_task", _fake_task)
+    counter = {"i": 0}
+
+    def _fake_mutate(
+        self,
+        seed_task,
+        *,
+        epoch,
+        seed_problem_id,
+        target_category,
+        level,
+        target_speedup_band,
+        failure_exemplars,
+        solver_trace_summary,
+        mutation_instruction,
+        decision_mode,
+        reason_code,
+        teacher_seed_rationale,
+    ):
+        counter["i"] += 1
+        return MutatedTask(
+            task_id=f"mut_{epoch}_{counter['i']}",
+            parent_task_id=f"seed_{seed_problem_id}",
+            seed_problem_id=seed_problem_id,
+            name=f"mut_task_{seed_problem_id}",
+            reference_code=seed_task.reference_code + f"\n# mut {counter['i']}",
+            interface_signature_hash="sig",
+            category_tags=("activation",),
+            category_id=target_category or "activation",
+            mutation_backend="dry_run",
+            mutation_model_id="dry_run",
+            mutation_prompt_hash=f"prompt_{counter['i']}",
+            novelty_hash=f"novel_{counter['i']}",
+            epoch_created=epoch,
+            mutation_type="logic_restructuring",
+            optimization_prompt="focus memory access",
+            teacher_decision_mode=decision_mode,
+            teacher_reason_code=reason_code,
+            teacher_target_speedup_band=target_speedup_band,
+            teacher_mutation_instruction=mutation_instruction,
+            solver_trace_summary=solver_trace_summary,
+            teacher_failure_entry_ids=tuple(
+                str(row.get("entry_id", "")) for row in (failure_exemplars or [])
+            ),
+            teacher_seed_rationale=teacher_seed_rationale or "",
+        )
+
+    monkeypatch.setattr(adaptive_train.KernelMutator, "mutate", _fake_mutate)
+
+    run_dir = tmp_path / "run_mini_reprofile"
+    rc = adaptive_train.main(
+        [
+            "--dry_run",
+            "--split_train",
+            str(split_train),
+            "--split_eval",
+            str(split_eval),
+            "--epochs",
+            "1",
+            "--tasks_per_epoch",
+            "2",
+            "--k",
+            "1",
+            "--mini_reprofile_every",
+            "1",
+            "--mini_reprofile_probe_tasks",
+            "1",
+            "--mini_reprofile_k",
+            "1",
+            "--budget_tier",
+            "full",
+            "--log_path",
+            str(run_dir),
+        ]
+    )
+    assert rc == 0
+    summary = [json.loads(line) for line in (run_dir / "epoch_summary.jsonl").read_text().splitlines()]
+    assert summary
+    assert summary[0]["curriculum"]["mini_reprofile_events"] >= 1
+    kpi_rows = [json.loads(line) for line in (run_dir / "kpi_dashboard.jsonl").read_text().splitlines()]
+    assert kpi_rows[0]["mini_reprofile_events"] >= 1
+    profiles = [json.loads(line) for line in (run_dir / "capability_profiles.jsonl").read_text().splitlines()]
+    assert any(row["split"] == "eval_rolling" for row in profiles)
 
 
 def test_build_mixed_train_handles_uses_available_levels(monkeypatch):
