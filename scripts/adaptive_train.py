@@ -792,7 +792,7 @@ def build_parser() -> argparse.ArgumentParser:
         choices=["frontier_band", "inverse_correctness", "loss_proportional", "easy_to_hard_static", "random"],
     )
     parser.add_argument("--teacher_backend", type=str, default="tinker", choices=["heuristic", "tinker"])
-    parser.add_argument("--teacher_model_id", type=str, default="Qwen/Qwen3-30B-A3B-Instruct-2507")
+    parser.add_argument("--teacher_model_id", type=str, default="Qwen/Qwen3-235B-A22B-Instruct-2507")
     parser.add_argument("--teacher_renderer_name", type=str, default="")
     parser.add_argument("--teacher_request_timeout_s", type=float, default=45.0)
     parser.add_argument("--teacher_temperature", type=float, default=0.1)
