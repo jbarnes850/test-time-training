@@ -11,7 +11,8 @@ ruff_cache/
 .idea/
 .vscode/
 .claude/
-configs/
+configs/*
+!configs/settings.json
 runs/
 arxiv/
 docs/REVIEWER_PERSONA.md

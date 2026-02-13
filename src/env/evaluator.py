@@ -1,8 +1,11 @@
 from dataclasses import dataclass
+import logging
 import os
 import sys
 from pathlib import Path
 import hashlib
+
+logger = logging.getLogger(__name__)
 
 from src.env.schema import EvalResult
 from src.utils.feedback_utils import extract_error_info
@@ -25,7 +28,11 @@ def _ensure_kernelbench_on_path() -> Path:
     root = repo_root()
     settings_path = root / "configs" / "settings.json"
     if not settings_path.exists():
-        raise FileNotFoundError("Missing configs/settings.json")
+        raise FileNotFoundError(
+            f"Missing {settings_path}. "
+            "Create it with: "
+            'echo \'{"kernelbench_root": "vendor/KernelBench"}\' > configs/settings.json'
+        )
     import json
     cfg = json.loads(settings_path.read_text())
     kb_root_value = cfg.get("kernelbench_root")
@@ -134,4 +141,5 @@ def evaluate_kernel(problem_id: int, kernel_code: str, level: int = 1, config: E
             metadata=metadata,
         )
     except Exception as exc:
+        logger.error("evaluate_kernel(problem_id=%d, level=%d) failed: %s", problem_id, level, exc)
         return _error_result(str(exc))
