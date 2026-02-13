@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import statistics
@@ -729,7 +730,8 @@ def main(argv: list[str] | None = None) -> int:
             for idx, (kernel_code, eval_result, reward) in enumerate(
                 zip(solve_outcome.kernel_codes, solve_outcome.eval_results, solve_outcome.rewards)
             ):
-                entry_id = f"{mutated.task_id}_{idx}_{abs(hash(kernel_code))}"
+                kernel_hash = hashlib.sha256(kernel_code.encode("utf-8")).hexdigest()[:16]
+                entry_id = f"{mutated.task_id}_{idx}_{kernel_hash}"
                 replay_entry = ReplayEntry(
                     entry_id=entry_id,
                     task_id=mutated.task_id,
