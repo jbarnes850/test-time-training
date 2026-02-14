@@ -1201,3 +1201,49 @@ def test_training_cost_not_charged_when_no_training_step(tmp_path: Path, monkeyp
     tracker = json.loads((run_dir / "cost_tracker.json").read_text())
     train_events = [event for event in tracker["events"] if event.get("component") == "train"]
     assert train_events == []
+
+
+def test_bootstrap_exit_hysteresis_requires_patience(tmp_path: Path, monkeypatch):
+    split_train = tmp_path / "split_train.json"
+    split_eval = tmp_path / "split_eval.json"
+    _write_split(split_train)
+    _write_split(split_eval)
+    monkeypatch.setattr(adaptive_train, "load_task", _fake_task)
+
+    call_count = {"n": 0}
+    original_fn = adaptive_train._bootstrap_mode_active
+
+    def _alternating_bootstrap(profiles_by_zone):
+        call_count["n"] += 1
+        if call_count["n"] <= 1:
+            return True
+        return original_fn(profiles_by_zone)
+
+    monkeypatch.setattr(adaptive_train, "_bootstrap_mode_active", _alternating_bootstrap)
+
+    run_dir = tmp_path / "run_hysteresis"
+    rc = adaptive_train.main(
+        [
+            "--dry_run",
+            "--no-enable_admission_gate",
+            "--split_train",
+            str(split_train),
+            "--split_eval",
+            str(split_eval),
+            "--epochs",
+            "2",
+            "--tasks_per_epoch",
+            "1",
+            "--k",
+            "1",
+            "--bootstrap_exit_patience",
+            "3",
+            "--budget_tier",
+            "full",
+            "--log_path",
+            str(run_dir),
+        ]
+    )
+    assert rc == 0
+    summaries = [json.loads(line) for line in (run_dir / "epoch_summary.jsonl").read_text().splitlines()]
+    assert len(summaries) == 2

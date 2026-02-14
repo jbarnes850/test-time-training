@@ -48,6 +48,24 @@ def test_dry_run_solver_backend_skips_empty_training():
     assert train_result.sampler_path == solver.sampler_path
 
 
+def test_dry_run_solver_weighted_training_accepts_weights():
+    solver = DryRunSolverBackend()
+    outcome = solver.solve_task(
+        _task(7),
+        k=3,
+        temperature=0.2,
+        max_tokens=64,
+        level=1,
+        eval_workers=1,
+    )
+    train_result = solver.train_on_outcomes(
+        [outcome], epoch=3, datum_weights=[0.5]
+    )
+    assert train_result.training_executed is True
+    assert train_result.datum_count == 3
+    assert train_result.outcomes_used == 1
+
+
 def test_dry_run_solver_metadata_shape():
     solver = DryRunSolverBackend()
     md = solver.metadata()

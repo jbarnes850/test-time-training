@@ -105,5 +105,22 @@ class ReplayEntry:
     is_mutated: bool = False
 
 
+@dataclass(frozen=True)
+class TrainingArtifact:
+    entry_id: str
+    outcome_id: str
+    epoch: int
+    zone: str
+    utility_score: float
+    category_id: str
+    problem_id: Optional[int]
+    level: Optional[int]
+    prompt_tokens: list[int]
+    sampled_tokens: list[int]
+    sampled_logprobs: list[float]
+    reward: float
+    sampler_path: str
+
+
 def to_json_dict(obj) -> Dict[str, Any]:
     return asdict(obj)

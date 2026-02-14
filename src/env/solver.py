@@ -36,6 +36,7 @@ class SolveOutcome:
     eval_results: list[EvalResult]
     rewards: list[float]
     wall_clock_s: float
+    prompt_tokens: list[int] | None = None
 
 
 @dataclass(frozen=True)
@@ -69,6 +70,7 @@ class SolverBackend(Protocol):
         outcomes: list[SolveOutcome],
         *,
         epoch: int,
+        datum_weights: list[float] | None = None,
     ) -> TrainStepResult:
         ...
 
@@ -124,9 +126,16 @@ class DryRunSolverBackend:
             eval_results=eval_results,
             rewards=rewards,
             wall_clock_s=time.time() - start,
+            prompt_tokens=[],
         )
 
-    def train_on_outcomes(self, outcomes: list[SolveOutcome], *, epoch: int) -> TrainStepResult:
+    def train_on_outcomes(
+        self,
+        outcomes: list[SolveOutcome],
+        *,
+        epoch: int,
+        datum_weights: list[float] | None = None,
+    ) -> TrainStepResult:
         if not outcomes:
             return TrainStepResult(
                 sampler_path=self.sampler_path,
@@ -249,6 +258,10 @@ class TinkerSolverBackend:
                 eval_results[idx] = future.result()
 
         rewards = [compute_reward(r.speedup, r.correctness) for r in eval_results]
+        try:
+            extracted_prompt_tokens = prompt.to_ints()
+        except (ValueError, AttributeError):
+            extracted_prompt_tokens = None
         return SolveOutcome(
             prompt=prompt,
             sampled_tokens=sampled_tokens,
@@ -258,6 +271,7 @@ class TinkerSolverBackend:
             eval_results=eval_results,
             rewards=rewards,
             wall_clock_s=time.time() - start,
+            prompt_tokens=extracted_prompt_tokens,
         )
 
     def train_on_outcomes(
@@ -265,6 +279,7 @@ class TinkerSolverBackend:
         outcomes: list[SolveOutcome],
         *,
         epoch: int,
+        datum_weights: list[float] | None = None,
     ) -> TrainStepResult:
         if not self.training_enabled or self._training_client is None:
             return TrainStepResult(
@@ -276,15 +291,22 @@ class TinkerSolverBackend:
 
         all_datums = []
         outcomes_used = 0
-        for outcome in outcomes:
-            if outcome.prompt is None:
+        for i, outcome in enumerate(outcomes):
+            prompt = outcome.prompt
+            if prompt is None and outcome.prompt_tokens:
+                try:
+                    prompt = self._tinker.ModelInput.from_ints(outcome.prompt_tokens)
+                except Exception:
+                    prompt = None
+            if prompt is None:
                 continue
             if not outcome.sampled_tokens or not outcome.sampled_logprobs:
                 continue
+            weight = datum_weights[i] if datum_weights else 1.0
             mean_reward = statistics.mean(outcome.rewards) if outcome.rewards else 0.0
-            advantages = [r - mean_reward for r in outcome.rewards]
+            advantages = [(r - mean_reward) * weight for r in outcome.rewards]
             datums = build_datums_from_group(
-                outcome.prompt,
+                prompt,
                 outcome.sampled_tokens,
                 outcome.sampled_logprobs,
                 advantages,

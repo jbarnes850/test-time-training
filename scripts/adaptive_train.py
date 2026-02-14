@@ -16,6 +16,7 @@ from src.env.evaluator import EvalResult
 from src.env.mutator import ApiMutatorBackend, KernelMutator, TinkerMutatorBackend
 from src.env.replay_buffer import ReplayBuffer
 from src.env.schema import CapabilityProfile, KernelTask, ReplayEntry
+from src.env.training_replay import TrainingReplayBuffer
 from src.env.solver import (
     DryRunSolverBackend,
     SolveOutcome,
@@ -832,6 +833,15 @@ def _bootstrap_mode_active(profiles_by_zone: dict[str, list[CapabilityProfile]])
     return not learning and not mastered
 
 
+def _compute_forgetting_indicator(
+    profiles_by_zone: dict[str, list[CapabilityProfile]],
+    prior_mastered: set[str],
+) -> dict[str, Any]:
+    current_mastered = {p.category_id for p in profiles_by_zone.get(ZONE_MASTERED, [])}
+    regressed = sorted(prior_mastered - current_mastered)
+    return {"regressed_categories": regressed, "count": len(regressed)}
+
+
 def _select_bootstrap_seed_task(
     *,
     replay_buffer: ReplayBuffer,
@@ -1001,6 +1011,79 @@ def _apply_experiment_arm_defaults(args: argparse.Namespace) -> tuple[str, dict[
     return arm, applied
 
 
+def _build_training_batch(
+    current_outcomes: list[SolveOutcome],
+    current_zones: list[str],
+    current_utilities: list[float],
+    training_replay: TrainingReplayBuffer,
+    *,
+    current_epoch: int,
+    replay_fraction: float = 0.30,
+    recency_epochs: int = 3,
+    decay_rate: float = 0.8,
+    std_threshold: float = 1e-5,
+) -> tuple[list[SolveOutcome], list[float]]:
+    learning_outcomes: list[SolveOutcome] = []
+    learning_weights: list[float] = []
+    for outcome, zone, utility in zip(current_outcomes, current_zones, current_utilities):
+        if zone not in {ZONE_LEARNING, ZONE_MASTERED}:
+            continue
+        if not outcome.rewards:
+            continue
+        reward_std = statistics.pstdev(outcome.rewards) if len(outcome.rewards) > 1 else 0.0
+        variance_factor = min(1.0, reward_std / std_threshold) if std_threshold > 0 else 1.0
+        w = utility * 1.0 * variance_factor
+        learning_outcomes.append(outcome)
+        learning_weights.append(w)
+
+    replay_artifacts = training_replay.sample_replay(
+        current_epoch=current_epoch,
+        recency_epochs=recency_epochs,
+        zone_filter=ZONE_LEARNING,
+    )
+    n_current = len(learning_outcomes)
+    total_target = int(n_current / (1.0 - replay_fraction)) if replay_fraction < 1.0 else n_current * 2
+    n_replay_target = max(0, total_target - n_current)
+    n_replay = min(n_replay_target, len(replay_artifacts))
+
+    replay_outcomes: list[SolveOutcome] = []
+    replay_weights: list[float] = []
+    if n_replay > 0:
+        grouped: dict[str, list] = {}
+        for artifact in replay_artifacts[:n_replay]:
+            grouped.setdefault(artifact.outcome_id, []).append(artifact)
+        for outcome_id, artifacts in grouped.items():
+            age = max(0, current_epoch - artifacts[0].epoch)
+            recency_decay = decay_rate ** age
+            utility = artifacts[0].utility_score
+            rewards = [a.reward for a in artifacts]
+            reward_std = statistics.pstdev(rewards) if len(rewards) > 1 else 0.0
+            variance_factor = min(1.0, reward_std / std_threshold) if std_threshold > 0 else 1.0
+            w = utility * recency_decay * variance_factor
+            replay_outcome = SolveOutcome(
+                prompt=None,
+                sampled_tokens=[a.sampled_tokens for a in artifacts],
+                sampled_logprobs=[a.sampled_logprobs for a in artifacts],
+                raw_actions=[],
+                kernel_codes=[],
+                eval_results=[],
+                rewards=rewards,
+                wall_clock_s=0.0,
+                prompt_tokens=artifacts[0].prompt_tokens,
+            )
+            replay_outcomes.append(replay_outcome)
+            replay_weights.append(w)
+
+    mixed_outcomes = learning_outcomes + replay_outcomes
+    raw_weights = learning_weights + replay_weights
+    if not raw_weights:
+        return mixed_outcomes, [1.0] * len(mixed_outcomes)
+    clipped = [max(0.01, min(5.0, w)) for w in raw_weights]
+    mean_w = statistics.mean(clipped) if clipped else 1.0
+    normalized = [w / mean_w if mean_w > 0 else 1.0 for w in clipped]
+    return mixed_outcomes, normalized
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser()
     parser.add_argument(
@@ -1096,6 +1179,10 @@ def build_parser() -> argparse.ArgumentParser:
         choices=["adaptive", "fixed"],
     )
     parser.add_argument("--replay_recency_window", type=int, default=200)
+    parser.add_argument("--replay_fraction", type=float, default=0.30)
+    parser.add_argument("--replay_recency_epochs", type=int, default=3)
+    parser.add_argument("--replay_decay_rate", type=float, default=0.8)
+    parser.add_argument("--bootstrap_exit_patience", type=int, default=2)
     parser.add_argument("--log_path", type=str, default="runs/adaptive_phase1")
     parser.add_argument("--resume_from", type=str, default="")
     parser.add_argument("--budget_tier", type=str, default="smoke", choices=["smoke", "signal", "full"])
@@ -1221,6 +1308,8 @@ def main(argv: list[str] | None = None) -> int:
     kpi_dashboard_path = run_dir / "kpi_dashboard.jsonl"
 
     replay_buffer = ReplayBuffer(replay_path)
+    training_artifacts_path = run_dir / "training_artifacts.jsonl"
+    training_replay = TrainingReplayBuffer(training_artifacts_path)
     if teacher_backend_name == "tinker":
         teacher_backend = TinkerLLMTeacherBackend(
             model_id=args.teacher_model_id,
@@ -1394,6 +1483,9 @@ def main(argv: list[str] | None = None) -> int:
     prev_frontier_size: float | None = None
     prev_too_hard_size: float | None = None
     low_signal_streak = 0
+    bootstrap_exit_confirmations = 0
+    bootstrap_mode = True
+    prior_mastered_categories: set[str] = set()
 
     for epoch in range(start_epoch, args.epochs):
         mutator_primary.reset_stats()
@@ -1492,7 +1584,14 @@ def main(argv: list[str] | None = None) -> int:
             zone_plan.extend([ZONE_LEARNING] * (slot_count - len(zone_plan)))
         zone_plan = zone_plan[:slot_count]
         realized_zone_counts = {ZONE_MASTERED: 0, ZONE_LEARNING: 0, ZONE_TOO_HARD: 0}
-        bootstrap_mode = _bootstrap_mode_active(profiles_by_zone)
+        if _bootstrap_mode_active(profiles_by_zone):
+            bootstrap_mode = True
+            bootstrap_exit_confirmations = 0
+        else:
+            bootstrap_exit_confirmations += 1
+            if bootstrap_exit_confirmations >= args.bootstrap_exit_patience:
+                bootstrap_mode = False
+                bootstrap_exit_confirmations = 0
         bootstrap_mode_entered = bootstrap_mode
         bootstrap_count = 0
         bootstrap_seed_source_counts: dict[str, int] = {
@@ -1502,6 +1601,8 @@ def main(argv: list[str] | None = None) -> int:
         }
 
         solve_outcomes: list[SolveOutcome] = []
+        solve_zones: list[str] = []
+        solve_utilities: list[float] = []
         slot_idx = 0
         mini_reprofile_events = 0
         admission_attempted_tasks = 0
@@ -1982,17 +2083,23 @@ def main(argv: list[str] | None = None) -> int:
                 eval_workers=args.eval_workers,
             )
             solve_outcomes.append(solve_outcome)
+            solve_zones.append(effective_zone)
+            solve_utilities.append(
+                preferred_profile.utility_score if preferred_profile is not None else 0.0
+            )
             cost_tracker.add_cost(
                 "solve",
                 gpu_hours=solve_outcome.wall_clock_s / 3600.0,
                 api_usd=0.0 if args.dry_run else args.solve_api_usd_per_task,
                 epoch=epoch,
             )
+            outcome_entry_ids: list[str] = []
             for idx, (kernel_code, eval_result, reward) in enumerate(
                 zip(solve_outcome.kernel_codes, solve_outcome.eval_results, solve_outcome.rewards)
             ):
                 kernel_hash = hashlib.sha256(kernel_code.encode("utf-8")).hexdigest()[:16]
                 entry_id = f"{mutated.task_id}_{idx}_{kernel_hash}"
+                outcome_entry_ids.append(entry_id)
                 replay_entry = ReplayEntry(
                     entry_id=entry_id,
                     task_id=mutated.task_id,
@@ -2014,6 +2121,24 @@ def main(argv: list[str] | None = None) -> int:
                 epoch_records += 1
                 if eval_result.correctness and eval_result.speedup > 1.0:
                     successful_records += 1
+            if args.enable_training and solve_outcome.sampled_tokens:
+                training_replay.add_outcome(
+                    outcome_id=f"{mutated.task_id}_{epoch}",
+                    epoch=epoch,
+                    zone=effective_zone,
+                    utility_score=(
+                        preferred_profile.utility_score if preferred_profile is not None else 0.0
+                    ),
+                    category_id=mutated.category_id,
+                    problem_id=seed_problem_id,
+                    level=seed_level,
+                    prompt_tokens=solve_outcome.prompt_tokens or [],
+                    sampled_tokens_list=solve_outcome.sampled_tokens,
+                    sampled_logprobs_list=solve_outcome.sampled_logprobs,
+                    rewards=solve_outcome.rewards,
+                    entry_ids=outcome_entry_ids,
+                    sampler_path=solver.sampler_path,
+                )
 
             should_mini_reprofile = (
                 args.mini_reprofile_every > 0
@@ -2072,7 +2197,12 @@ def main(argv: list[str] | None = None) -> int:
                     )
                     profiles_by_zone = teacher.profiles_by_zone()
                     if bootstrap_mode and not _bootstrap_mode_active(profiles_by_zone):
-                        bootstrap_mode = False
+                        bootstrap_exit_confirmations += 1
+                        if bootstrap_exit_confirmations >= args.bootstrap_exit_patience:
+                            bootstrap_mode = False
+                            bootstrap_exit_confirmations = 0
+                    elif bootstrap_mode:
+                        bootstrap_exit_confirmations = 0
                     observed_zone_counts = _zone_counts_from_profiles(profiles)
                     if args.curriculum_controller == "adaptive":
                         adjusted_quotas, quota_adjustment = _adaptive_zone_quotas(
@@ -2103,20 +2233,58 @@ def main(argv: list[str] | None = None) -> int:
                         zone_plan = zone_plan[:slot_idx] + remaining_plan[:remaining_slots]
                     mini_reprofile_events += 1
 
-        training_activity = {
+        training_activity: dict[str, Any] = {
             "attempted": bool(args.enable_training),
             "executed": False,
             "datum_count": 0,
             "outcomes_used": 0,
+            "current_frontier_count": 0,
+            "replay_count": 0,
+            "current_fraction": 0.0,
+            "replay_fraction_actual": 0.0,
+            "mean_datum_weight": 0.0,
+            "replay_epochs_represented": [],
         }
         if args.enable_training:
-            train_result = solver.train_on_outcomes(solve_outcomes, epoch=epoch)
+            mixed_outcomes, datum_weights = _build_training_batch(
+                current_outcomes=solve_outcomes,
+                current_zones=solve_zones,
+                current_utilities=solve_utilities,
+                training_replay=training_replay,
+                current_epoch=epoch,
+                replay_fraction=args.replay_fraction,
+                recency_epochs=args.replay_recency_epochs,
+                decay_rate=args.replay_decay_rate,
+                std_threshold=args.effective_task_std_threshold,
+            )
+            n_current = len(solve_outcomes)
+            n_replay = max(0, len(mixed_outcomes) - n_current)
+            n_total = len(mixed_outcomes)
+            replay_epoch_set = sorted({
+                a.epoch
+                for a in training_replay.sample_replay(
+                    current_epoch=epoch,
+                    recency_epochs=args.replay_recency_epochs,
+                    zone_filter=ZONE_LEARNING,
+                )
+            })
+            train_result = solver.train_on_outcomes(
+                mixed_outcomes, epoch=epoch, datum_weights=datum_weights
+            )
             solver.sampler_path = train_result.sampler_path
             training_activity = {
                 "attempted": True,
                 "executed": bool(train_result.training_executed),
                 "datum_count": int(train_result.datum_count),
                 "outcomes_used": int(train_result.outcomes_used),
+                "current_frontier_count": n_current,
+                "replay_count": n_replay,
+                "current_fraction": n_current / n_total if n_total > 0 else 0.0,
+                "replay_fraction_actual": n_replay / n_total if n_total > 0 else 0.0,
+                "mean_datum_weight": (
+                    statistics.mean(datum_weights) if datum_weights else 0.0
+                ),
+                "replay_epochs_represented": replay_epoch_set,
             }
             if train_result.training_executed:
                 cost_tracker.add_cost(
@@ -2124,6 +2292,14 @@ def main(argv: list[str] | None = None) -> int:
                     api_usd=0.0 if args.dry_run else args.train_api_usd_per_epoch,
                     epoch=epoch,
                 )
+
+        forgetting = _compute_forgetting_indicator(profiles_by_zone, prior_mastered_categories)
+        training_activity["forgetting_indicator"] = forgetting
+        learning_zone_profiles = profiles_by_zone.get(ZONE_LEARNING, [])
+        training_activity["learning_zone_fraction"] = (
+            len(learning_zone_profiles)
+            / max(1, sum(len(v) for v in profiles_by_zone.values()))
+        )
 
         signal_stats = _gradient_signal_summary(
             solve_outcomes,
@@ -2193,11 +2369,20 @@ def main(argv: list[str] | None = None) -> int:
             "training_executed": training_activity["executed"],
             "training_datum_count": training_activity["datum_count"],
             "training_outcomes_used": training_activity["outcomes_used"],
+            "training_current_frontier_count": training_activity["current_frontier_count"],
+            "training_replay_count": training_activity["replay_count"],
+            "training_replay_fraction_actual": training_activity["replay_fraction_actual"],
+            "training_mean_datum_weight": training_activity["mean_datum_weight"],
+            "training_replay_epochs_represented": training_activity["replay_epochs_represented"],
             "bootstrap_mode_entered": bootstrap_mode_entered,
             "bootstrap_mode_active_end": bootstrap_mode,
             "bootstrap_count": bootstrap_count,
             "bootstrap_seed_source_counts": dict(bootstrap_seed_source_counts),
         }
+        forgetting = _compute_forgetting_indicator(profiles_by_zone, prior_mastered_categories)
+        kpi_payload["forgetting_indicator"] = forgetting
+        current_mastered = {p.category_id for p in profiles_by_zone.get(ZONE_MASTERED, [])}
+        prior_mastered_categories = prior_mastered_categories | current_mastered
         _append_jsonl(kpi_dashboard_path, kpi_payload)
         prev_frontier_size = frontier_size
         prev_too_hard_size = too_hard_size
@@ -2260,6 +2445,12 @@ def main(argv: list[str] | None = None) -> int:
                     "training_executed": training_activity["executed"],
                     "training_datum_count": training_activity["datum_count"],
                     "training_outcomes_used": training_activity["outcomes_used"],
+                    "training_current_frontier_count": training_activity["current_frontier_count"],
+                    "training_replay_count": training_activity["replay_count"],
+                    "training_replay_fraction_actual": training_activity["replay_fraction_actual"],
+                    "training_mean_datum_weight": training_activity["mean_datum_weight"],
+                    "learning_zone_fraction": training_activity.get("learning_zone_fraction", 0.0),
+                    "forgetting_indicator": forgetting,
                     "bootstrap_mode_entered": bootstrap_mode_entered,
                     "bootstrap_mode_active_end": bootstrap_mode,
                     "bootstrap_count": bootstrap_count,
