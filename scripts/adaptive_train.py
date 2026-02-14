@@ -1667,7 +1667,7 @@ def main(argv: list[str] | None = None) -> int:
                 epoch=epoch,
             )
             mutator_target_category = seed_category
-            use_frontier_mutator = decision_mode == "too_hard_decompose"
+            use_frontier_mutator = decision_mode == "too_hard_decompose" or bootstrap_mode
             if use_frontier_mutator:
                 mutated = mutator_frontier.mutate(
                     seed_task,
