@@ -1042,6 +1042,24 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--enable_training", action="store_true")
     parser.add_argument("--lora_rank", type=int, default=8)
     parser.add_argument("--learning_rate", type=float, default=1e-5)
+    parser.add_argument(
+        "--min_discovery_epochs",
+        type=int,
+        default=0,
+        help="Skip training for the first N epochs to accumulate replay diversity",
+    )
+    parser.add_argument(
+        "--train_subsample_per_outcome",
+        type=int,
+        default=0,
+        help="Max rollouts per outcome for training datums (0 = use all k)",
+    )
+    parser.add_argument(
+        "--rollback_threshold",
+        type=float,
+        default=0.0,
+        help="If agg_fast_1 drops by this fraction, skip next train + halve LR (0 = disabled)",
+    )
     parser.add_argument("--renderer_name", type=str, default="gpt_oss_no_sysprompt")
     parser.add_argument("--mutator_backend", type=str, default="tinker", choices=["tinker", "api_stub"])
     parser.add_argument("--mutator_model_path", type=str, default="Qwen/Qwen3-30B-A3B-Instruct-2507")
@@ -1395,6 +1413,8 @@ def main(argv: list[str] | None = None) -> int:
     bootstrap_exit_confirmations = 0
     bootstrap_mode = True
     prior_mastered_categories: set[str] = set()
+    prev_agg_fast_1: float | None = None
+    train_skip_next = False
 
     for epoch in range(start_epoch, args.epochs):
         mutator_primary.reset_stats()
@@ -2087,7 +2107,14 @@ def main(argv: list[str] | None = None) -> int:
             "mean_datum_weight": 0.0,
             "replay_epochs_represented": [],
         }
-        if args.enable_training:
+        train_gated = (
+            args.enable_training
+            and epoch >= args.min_discovery_epochs
+            and not train_skip_next
+        )
+        if train_skip_next:
+            train_skip_next = False
+        if train_gated:
             mixed_outcomes, datum_weights = _build_training_batch(
                 current_outcomes=solve_outcomes,
                 current_zones=solve_zones,
@@ -2110,8 +2137,12 @@ def main(argv: list[str] | None = None) -> int:
                     zone_filter=ZONE_LEARNING,
                 )
             })
+            subsample = args.train_subsample_per_outcome or None
             train_result = solver.train_on_outcomes(
-                mixed_outcomes, epoch=epoch, datum_weights=datum_weights
+                mixed_outcomes,
+                epoch=epoch,
+                datum_weights=datum_weights,
+                max_samples_per_outcome=subsample,
             )
             solver.sampler_path = train_result.sampler_path
             training_activity = {
@@ -2153,6 +2184,25 @@ def main(argv: list[str] | None = None) -> int:
         aggregate_fast_1 = (
             statistics.mean([float(row.get("fast_1", 0.0)) for row in profile_rows]) if profile_rows else 0.0
         )
+        rollback_event: dict[str, Any] | None = None
+        if (
+            args.rollback_threshold > 0
+            and prev_agg_fast_1 is not None
+            and prev_agg_fast_1 > 0
+        ):
+            drop_frac = (prev_agg_fast_1 - aggregate_fast_1) / prev_agg_fast_1
+            if drop_frac > args.rollback_threshold:
+                solver.learning_rate /= 2.0
+                train_skip_next = True
+                rollback_event = {
+                    "epoch": epoch,
+                    "prev_agg_fast_1": prev_agg_fast_1,
+                    "current_agg_fast_1": aggregate_fast_1,
+                    "drop_fraction": drop_frac,
+                    "new_learning_rate": solver.learning_rate,
+                    "action": "skip_next_train_and_halve_lr",
+                }
+        prev_agg_fast_1 = aggregate_fast_1
         frontier_size = observed_zone_counts.get(ZONE_LEARNING, 0.0)
         too_hard_size = observed_zone_counts.get(ZONE_TOO_HARD, 0.0)
         frontier_delta = (
@@ -2207,6 +2257,7 @@ def main(argv: list[str] | None = None) -> int:
             "bootstrap_mode_active_end": bootstrap_mode,
             "bootstrap_count": bootstrap_count,
             "bootstrap_seed_source_counts": dict(bootstrap_seed_source_counts),
+            "rollback_event": rollback_event,
         }
         forgetting = _compute_forgetting_indicator(profiles_by_zone, prior_mastered_categories)
         kpi_payload["forgetting_indicator"] = forgetting

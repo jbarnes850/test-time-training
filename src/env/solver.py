@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import random
 import statistics
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -71,6 +72,7 @@ class SolverBackend(Protocol):
         *,
         epoch: int,
         datum_weights: list[float] | None = None,
+        max_samples_per_outcome: int | None = None,
     ) -> TrainStepResult:
         ...
 
@@ -85,6 +87,7 @@ class DryRunSolverBackend:
         self.model_id = "dry_run/model"
         self.sampler_path = sampler_path
         self.training_enabled = False
+        self.learning_rate = 0.0
 
     def solve_task(
         self,
@@ -135,6 +138,7 @@ class DryRunSolverBackend:
         *,
         epoch: int,
         datum_weights: list[float] | None = None,
+        max_samples_per_outcome: int | None = None,
     ) -> TrainStepResult:
         if not outcomes:
             return TrainStepResult(
@@ -280,6 +284,7 @@ class TinkerSolverBackend:
         *,
         epoch: int,
         datum_weights: list[float] | None = None,
+        max_samples_per_outcome: int | None = None,
     ) -> TrainStepResult:
         if not self.training_enabled or self._training_client is None:
             return TrainStepResult(
@@ -305,10 +310,17 @@ class TinkerSolverBackend:
             weight = datum_weights[i] if datum_weights else 1.0
             mean_reward = statistics.mean(outcome.rewards) if outcome.rewards else 0.0
             advantages = [(r - mean_reward) * weight for r in outcome.rewards]
+            tokens = outcome.sampled_tokens
+            logprobs = outcome.sampled_logprobs
+            if max_samples_per_outcome and len(advantages) > max_samples_per_outcome:
+                indices = sorted(random.sample(range(len(advantages)), max_samples_per_outcome))
+                tokens = [tokens[j] for j in indices]
+                logprobs = [logprobs[j] for j in indices]
+                advantages = [advantages[j] for j in indices]
             datums = build_datums_from_group(
                 prompt,
-                outcome.sampled_tokens,
-                outcome.sampled_logprobs,
+                tokens,
+                logprobs,
                 advantages,
             )
             all_datums.extend(datums)
