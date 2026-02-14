@@ -314,22 +314,29 @@ def _target_speedup_band_for_zone(zone: str) -> tuple[float, float]:
 def _mutation_instruction_for_zone(zone: str) -> str:
     if zone == ZONE_TOO_HARD:
         return (
-            "Decompose complexity by reducing one operation/fusion while preserving the "
-            "exact interface. Target a solver speedup in the 1.2x-1.6x band."
+            "Decompose complexity with exactly one local simplification while preserving the "
+            "exact interface and operator family. Keep the same core compute pattern and avoid "
+            "algebraic rewrites (e.g., matmul<->einsum), transpose-driven layout changes, or "
+            "new stride/reshape schemes. Target a solver speedup in the 1.2x-1.6x band."
         )
     if zone == ZONE_MASTERED:
         return (
-            "Increase compositional complexity by adding one operation while preserving the "
-            "exact interface. Target 1.8x-2.5x speedup to bridge toward harder regimes."
+            "Increase compositional complexity with exactly one local operation addition while "
+            "preserving the exact interface and the current solution family. Avoid global "
+            "algebraic rewrites and aggressive layout transformations. Target 1.8x-2.5x speedup "
+            "to bridge toward harder regimes."
         )
     if zone == ZONE_LEARNING:
         return (
-            "Generate a structurally harder variant by adding exactly one operation while "
-            "preserving interface. Target a solver speedup in the 1.3x-1.8x band."
+            "Generate a slightly harder but learnable variant using exactly one local change "
+            "while preserving interface and the same optimization strategy family. Avoid "
+            "transpose-induced layout shifts, matmul<->einsum rewrites, and new strided "
+            "reshape/batching patterns unless explicitly requested by failure context. Target a "
+            "solver speedup in the 1.3x-1.8x band."
         )
     return (
-        "Generate a valid interface-preserving mutation with moderate difficulty "
-        "targeting 1.2x-1.8x speedup."
+        "Generate a valid interface-preserving mutation with moderate difficulty and one local "
+        "structural change, avoiding global algebraic or layout rewrites. Target 1.2x-1.8x speedup."
     )
 
 

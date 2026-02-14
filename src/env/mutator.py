@@ -118,7 +118,7 @@ ALLOWED_MUTATION_TYPES = {
 MUTATION_SYSTEM_PROMPT = (
     "You are a kernel task mutator. Your role is to generate structurally novel benchmark tasks "
     "that preserve strict interface compatibility with the seed task. "
-    "Do not optimize for speed. Optimize for valid structural diversity.\n\n"
+    "Do not optimize for speed. Optimize for learnable structural diversity.\n\n"
     "Output format is mandatory:\n"
     "1) A fenced python code block containing the full reference code with class Model.\n"
     "2) A line: MUTATION_TYPE: <one_allowed_type>\n"
@@ -134,7 +134,14 @@ MUTATION_SYSTEM_PROMPT = (
     "- Keep the same class name: Model\n"
     "- Keep Model.forward interface exactly identical (same arg names/order/defaults)\n"
     "- Preserve input/output semantics and shape contract\n"
-    "- Change internal computational structure materially\n"
+    "- Apply exactly one local structural change per mutation\n"
+    "- Keep the mutation in the same solution family as the seed (incremental difficulty)\n"
+    "- Keep the task solvable with standard CUDA optimization strategies (tiling, coalescing, "
+    "shared memory, vectorization)\n"
+    "- Avoid global algebraic rewrites and layout shifts unless explicitly required by teacher "
+    "instruction or failure context\n"
+    "- Specifically avoid introducing matmul<->einsum rewrites, transpose-driven layout changes, "
+    "or new strided reshape/batching schemes by default\n"
     "- No markdown explanation outside required metadata lines\n"
 )
 

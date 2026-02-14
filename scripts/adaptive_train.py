@@ -96,6 +96,7 @@ EXPERIMENT_ARM_POLICY = {
 PRIMARY_MATCHED_COMPUTE_ARMS = ("B0", "B1", "B2", "C")
 PAPER_BASE_MODEL_ID = "openai/gpt-oss-120b"
 TEACHER_DEFAULT_MODEL_ID = "Qwen/Qwen3-235B-A22B-Instruct-2507"
+BOOTSTRAP_TARGET_SPEEDUP_BAND = (1.1, 1.5)
 
 
 @dataclass
@@ -1498,10 +1499,11 @@ def main(argv: list[str] | None = None) -> int:
                 )
                 decision_mode = "learning"
                 reason_code = "bootstrap"
-                target_speedup_band = _zone_target_speedup_band(ZONE_LEARNING)
+                target_speedup_band = BOOTSTRAP_TARGET_SPEEDUP_BAND
                 mutation_instruction = (
-                    "Bootstrap from a solvable anchor while preserving interface and "
-                    "adding one compositional change."
+                    "Bootstrap from a solvable anchor with one local structural change only. "
+                    "Preserve interface and keep the same solution family. Avoid transpose/layout "
+                    "rewrites, matmul<->einsum rewrites, and new strided reshape patterns."
                 )
                 seed_task, parent_task_id, seed_problem_id, seed_category, seed_level, bootstrap_seed_source = (
                     _select_bootstrap_seed_task(
@@ -1610,6 +1612,15 @@ def main(argv: list[str] | None = None) -> int:
             reason_code = seed_plan.reason_code or reason_code
             target_speedup_band = seed_plan.target_speedup_band or target_speedup_band
             mutation_instruction = seed_plan.mutation_instruction or mutation_instruction
+            if bootstrap_mode:
+                decision_mode = "learning"
+                reason_code = "bootstrap"
+                target_speedup_band = BOOTSTRAP_TARGET_SPEEDUP_BAND
+                mutation_instruction = (
+                    "Bootstrap: apply one local in-family change only; keep interface and semantics "
+                    "stable; avoid transpose/layout rewrites, matmul<->einsum rewrites, and new "
+                    "strided reshape/batching patterns."
+                )
             teacher_seed_rationale = seed_plan.rationale
             if teacher_backend_name == "tinker":
                 cost_tracker.add_cost(
