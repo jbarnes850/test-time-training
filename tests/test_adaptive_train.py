@@ -595,6 +595,86 @@ def test_select_bootstrap_seed_task_falls_back_to_l1_anchor(tmp_path: Path):
     assert seed_task.problem_id == 2
 
 
+def test_select_bootstrap_seed_task_rotates_l1_anchor(tmp_path: Path):
+    replay = adaptive_train.ReplayBuffer(tmp_path / "replay.jsonl")
+    handles = [
+        adaptive_train.TaskHandle(
+            task=_fake_task(6),
+            level=1,
+            category_tags=("unknown",),
+            category_id="unknown",
+        ),
+        adaptive_train.TaskHandle(
+            task=_fake_task(2),
+            level=1,
+            category_tags=("unknown",),
+            category_id="unknown",
+        ),
+        adaptive_train.TaskHandle(
+            task=_fake_task(4),
+            level=1,
+            category_tags=("unknown",),
+            category_id="unknown",
+        ),
+    ]
+    a0 = adaptive_train._select_bootstrap_seed_task(
+        replay_buffer=replay,
+        ranked_train_tasks=handles,
+        replay_recency_window=200,
+        bootstrap_index=0,
+    )
+    a1 = adaptive_train._select_bootstrap_seed_task(
+        replay_buffer=replay,
+        ranked_train_tasks=handles,
+        replay_recency_window=200,
+        bootstrap_index=1,
+    )
+    a3 = adaptive_train._select_bootstrap_seed_task(
+        replay_buffer=replay,
+        ranked_train_tasks=handles,
+        replay_recency_window=200,
+        bootstrap_index=3,
+    )
+    assert a0[2] == 2
+    assert a1[2] == 4
+    assert a3[2] == 2
+
+
+def test_bootstrap_mutation_guard_blocks_out_of_family_rewrites():
+    seed = """
+import torch
+import torch.nn as nn
+
+class Model(nn.Module):
+    def forward(self, A, B):
+        return torch.matmul(A, B)
+"""
+    mutated_bad = """
+import torch
+import torch.nn as nn
+
+class Model(nn.Module):
+    def forward(self, A, B):
+        return torch.einsum('ij,jk->ik', A, B.transpose(0, 1))
+"""
+    ok, reason = adaptive_train._passes_bootstrap_mutation_guard(seed, mutated_bad)
+    assert ok is False
+    assert reason in {"einsum_rewrite", "transpose_layout"}
+
+    mutated_ok = """
+import torch
+import torch.nn as nn
+
+class Model(nn.Module):
+    def forward(self, A, B):
+        out = torch.matmul(A, B)
+        return out + 0.0
+"""
+    ok2, reason2 = adaptive_train._passes_bootstrap_mutation_guard(seed, mutated_ok)
+    assert ok2 is True
+    assert reason2 == ""
+
+
 def test_bootstrap_mode_routes_through_mutate_solve_replay(tmp_path: Path, monkeypatch):
     split_train = tmp_path / "split_train.json"
     split_eval = tmp_path / "split_eval.json"

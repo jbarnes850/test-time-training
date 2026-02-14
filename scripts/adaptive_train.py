@@ -5,6 +5,7 @@ import hashlib
 import json
 import os
 import random
+import re
 import statistics
 import time
 from dataclasses import asdict, dataclass, field
@@ -97,6 +98,15 @@ PRIMARY_MATCHED_COMPUTE_ARMS = ("B0", "B1", "B2", "C")
 PAPER_BASE_MODEL_ID = "openai/gpt-oss-120b"
 TEACHER_DEFAULT_MODEL_ID = "Qwen/Qwen3-235B-A22B-Instruct-2507"
 BOOTSTRAP_TARGET_SPEEDUP_BAND = (1.1, 1.5)
+BOOTSTRAP_GUARD_PATTERNS: tuple[tuple[str, tuple[str, ...]], ...] = (
+    ("einsum_rewrite", ("torch.einsum(", "einsum(")),
+    ("transpose_layout", (".transpose(", "transpose(")),
+    ("permute_layout", (".permute(", "permute(")),
+    ("movedim_layout", (".movedim(", "movedim(")),
+    ("swapaxes_layout", (".swapaxes(", "swapaxes(")),
+    ("as_strided_layout", ("as_strided(",)),
+    ("explicit_stride", (".stride(", " stride(")),
+)
 
 
 @dataclass
@@ -827,6 +837,7 @@ def _select_bootstrap_seed_task(
     replay_buffer: ReplayBuffer,
     ranked_train_tasks: list[TaskHandle],
     replay_recency_window: int,
+    bootstrap_index: int = 0,
 ) -> tuple[KernelTask, str, int, str, int, str]:
     replay_seed = replay_buffer.select_seed(
         {
@@ -859,10 +870,11 @@ def _select_bootstrap_seed_task(
         key=lambda h: h.task.problem_id,
     )
     if l1_candidates:
-        anchor = l1_candidates[0]
+        anchor = l1_candidates[bootstrap_index % len(l1_candidates)]
         source = "l1_anchor"
     else:
-        anchor = sorted(ranked_train_tasks, key=lambda h: h.task.problem_id)[0]
+        train_candidates = sorted(ranked_train_tasks, key=lambda h: h.task.problem_id)
+        anchor = train_candidates[bootstrap_index % len(train_candidates)]
         source = "train_anchor"
     return (
         anchor.task,
@@ -878,6 +890,25 @@ def _budget_cap(args: argparse.Namespace) -> float:
     if args.budget_cap_usd is not None:
         return float(args.budget_cap_usd)
     return BUDGET_TIER_CAPS[args.budget_tier]
+
+
+def _passes_bootstrap_mutation_guard(
+    seed_reference_code: str,
+    mutated_reference_code: str,
+) -> tuple[bool, str]:
+    seed = seed_reference_code.lower()
+    mutated = mutated_reference_code.lower()
+    for label, probes in BOOTSTRAP_GUARD_PATTERNS:
+        seed_count = sum(seed.count(p) for p in probes)
+        mut_count = sum(mutated.count(p) for p in probes)
+        if mut_count > seed_count:
+            return False, label
+    # Guard against introducing explicit transpose shorthand such as B.T
+    seed_dot_t = len(re.findall(r"\.\s*t\b", seed))
+    mut_dot_t = len(re.findall(r"\.\s*t\b", mutated))
+    if mut_dot_t > seed_dot_t:
+        return False, "dot_t_layout"
+    return True, ""
 
 
 def _load_solver_paths(args: argparse.Namespace) -> tuple[str, str]:
@@ -1480,6 +1511,7 @@ def main(argv: list[str] | None = None) -> int:
         admission_gpu_hours = 0.0
         solver_rollouts_skipped_by_admission = 0
         admission_bootstrap_passthrough_used = 0
+        bootstrap_guard_rejections = 0
 
         while slot_idx < slot_count:
             slot_zone = zone_plan[slot_idx] if slot_idx < len(zone_plan) else ZONE_LEARNING
@@ -1510,6 +1542,7 @@ def main(argv: list[str] | None = None) -> int:
                         replay_buffer=replay_buffer,
                         ranked_train_tasks=ranked_train_tasks,
                         replay_recency_window=args.replay_recency_window,
+                        bootstrap_index=bootstrap_count,
                     )
                 )
                 bootstrap_count += 1
@@ -1746,6 +1779,60 @@ def main(argv: list[str] | None = None) -> int:
                 )
                 replay_buffer.append(bank_entry)
                 continue
+
+            if bootstrap_mode:
+                guard_ok, guard_reason = _passes_bootstrap_mutation_guard(
+                    seed_task.reference_code,
+                    mutated.reference_code,
+                )
+                if not guard_ok:
+                    bootstrap_guard_rejections += 1
+                    _append_jsonl(
+                        mutation_events_path,
+                        {
+                            "epoch": epoch,
+                            "status": "bootstrap_guard_rejected",
+                            "task_id": mutated.task_id,
+                            "seed_problem_id": seed_problem_id,
+                            "seed_category": seed_category,
+                            "requested_zone": slot_zone,
+                            "zone": effective_zone,
+                            "guard_reason": guard_reason,
+                            "mutation_type": mutated.mutation_type,
+                            "mutation_backend": mutated.mutation_backend,
+                            "mutation_model_id": mutated.mutation_model_id,
+                            "bootstrap_mode": True,
+                            "bootstrap_seed_source": bootstrap_seed_source,
+                        },
+                    )
+                    bank_eval = EvalResult(
+                        compiled=False,
+                        correctness=False,
+                        runtime_us=-1.0,
+                        ref_runtime_us=-1.0,
+                        speedup=0.0,
+                        metadata={"banked": True, "reason": "bootstrap_guard_rejected"},
+                    )
+                    replay_buffer.append(
+                        ReplayEntry(
+                            entry_id=f"bootstrap_guard_reject_{mutated.task_id}_{time.time_ns()}",
+                            task_id=mutated.task_id,
+                            parent_task_id=parent_task_id,
+                            problem_id=seed_problem_id,
+                            level=seed_level,
+                            category_id=mutated.category_id,
+                            task_reference_code=mutated.reference_code,
+                            kernel_code="",
+                            eval_result=bank_eval,
+                            reward=0.0,
+                            sampler_path=solver.sampler_path,
+                            backend="bootstrap_guard",
+                            timestamp=time.time(),
+                            epoch=epoch,
+                            is_mutated=True,
+                        )
+                    )
+                    continue
 
             realized_zone_counts[effective_zone] = realized_zone_counts.get(effective_zone, 0) + 1
             _append_jsonl(
@@ -2098,6 +2185,7 @@ def main(argv: list[str] | None = None) -> int:
             "admission_gpu_hours": admission_gpu_hours,
             "solver_rollouts_skipped_by_admission": solver_rollouts_skipped_by_admission,
             "admission_bootstrap_passthrough_used": admission_bootstrap_passthrough_used,
+            "bootstrap_guard_rejections": bootstrap_guard_rejections,
             "estimated_solver_compute_saved_samples": (
                 solver_rollouts_skipped_by_admission * max(0, int(args.k))
             ),
@@ -2167,6 +2255,7 @@ def main(argv: list[str] | None = None) -> int:
                         else 0.0
                     ),
                     "admission_bootstrap_passthrough_used": admission_bootstrap_passthrough_used,
+                    "bootstrap_guard_rejections": bootstrap_guard_rejections,
                     "training_attempted": training_activity["attempted"],
                     "training_executed": training_activity["executed"],
                     "training_datum_count": training_activity["datum_count"],
