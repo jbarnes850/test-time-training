@@ -28,13 +28,11 @@ class Model(nn.Module):
     return KernelTask(problem_id=problem_id, name=f"task_{problem_id}", reference_code=code)
 
 
-def test_cost_tracker_projection_math():
-    tracker = adaptive_train.CostTracker(gpu_hour_rate=2.0)
-    tracker.add_cost("profile", gpu_hours=1.0, api_usd=3.0, epoch=0)
-    assert tracker.total_usd == 5.0
-    epoch_cost = tracker.finalize_epoch(epoch=0, start_total_usd=0.0)
-    assert epoch_cost == 5.0
-    assert tracker.projected_total(remaining_epochs=2, fallback_epoch_cost_usd=10.0) == 15.0
+def test_budget_flags_are_accepted_without_cost_halt():
+    parser = adaptive_train.build_parser()
+    args = parser.parse_args(["--budget_tier", "smoke", "--default_epoch_cost_usd", "1000"])
+    assert args.budget_tier == "smoke"
+    assert args.default_epoch_cost_usd == 1000
 
 
 def test_adaptive_train_dry_run_writes_required_artifacts(tmp_path: Path, monkeypatch):
@@ -76,7 +74,6 @@ def test_adaptive_train_dry_run_writes_required_artifacts(tmp_path: Path, monkey
         "mutator_stats.jsonl",
         "mutation_events.jsonl",
         "kpi_dashboard.jsonl",
-        "cost_tracker.json",
         "checkpoint_state.json",
     ]:
         assert (run_dir / name).exists(), name
@@ -162,7 +159,7 @@ def test_adaptive_train_resume(tmp_path: Path, monkeypatch):
     assert state["next_epoch"] == 2
 
 
-def test_budget_projection_halts_before_epoch(tmp_path: Path, monkeypatch):
+def test_budget_projection_flags_do_not_halt_before_epoch(tmp_path: Path, monkeypatch):
     split_train = tmp_path / "split_train.json"
     split_eval = tmp_path / "split_eval.json"
     _write_split(split_train)
@@ -190,7 +187,7 @@ def test_budget_projection_halts_before_epoch(tmp_path: Path, monkeypatch):
     assert rc == 0
     rows = [json.loads(line) for line in (run_dir / "epoch_summary.jsonl").read_text().splitlines()]
     assert rows
-    assert rows[0]["status"] == "halted_budget_projection"
+    assert all(row.get("status") != "halted_budget_projection" for row in rows)
 
 
 def test_allocate_level_counts_sums_to_total():
@@ -1198,9 +1195,6 @@ def test_training_cost_not_charged_when_no_training_step(tmp_path: Path, monkeyp
     assert summary[0]["curriculum"]["training_executed"] is False
     assert summary[0]["curriculum"]["training_datum_count"] == 0
 
-    tracker = json.loads((run_dir / "cost_tracker.json").read_text())
-    train_events = [event for event in tracker["events"] if event.get("component") == "train"]
-    assert train_events == []
 
 
 def test_bootstrap_exit_hysteresis_requires_patience(tmp_path: Path, monkeypatch):

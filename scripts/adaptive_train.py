@@ -8,7 +8,7 @@ import random
 import re
 import statistics
 import time
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
 
@@ -43,12 +43,6 @@ from src.utils.path_utils import repo_root
 
 load_dotenv()
 
-
-BUDGET_TIER_CAPS = {
-    "smoke": 50.0,
-    "signal": 150.0,
-    "full": 500.0,
-}
 
 PHASE1_CLAIM_SCOPE = {
     "phase": "phase1_inner_loop_only",
@@ -108,76 +102,6 @@ BOOTSTRAP_GUARD_PATTERNS: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("as_strided_layout", ("as_strided(",)),
     ("explicit_stride", (".stride(", " stride(")),
 )
-
-
-@dataclass
-class CostTracker:
-    gpu_hour_rate: float = 1.20
-    total_gpu_hours: float = 0.0
-    total_api_usd: float = 0.0
-    total_usd: float = 0.0
-    events: list[dict[str, Any]] = field(default_factory=list)
-    epoch_costs: list[dict[str, Any]] = field(default_factory=list)
-
-    def add_cost(
-        self,
-        component: str,
-        *,
-        gpu_hours: float = 0.0,
-        api_usd: float = 0.0,
-        epoch: int | None = None,
-    ) -> None:
-        gpu_hours = max(0.0, float(gpu_hours))
-        api_usd = max(0.0, float(api_usd))
-        gpu_cost = gpu_hours * self.gpu_hour_rate
-        self.total_gpu_hours += gpu_hours
-        self.total_api_usd += api_usd
-        self.total_usd += gpu_cost + api_usd
-        self.events.append(
-            {
-                "timestamp": time.time(),
-                "epoch": epoch,
-                "component": component,
-                "gpu_hours": gpu_hours,
-                "gpu_cost_usd": gpu_cost,
-                "api_cost_usd": api_usd,
-                "running_total_usd": self.total_usd,
-            }
-        )
-
-    def finalize_epoch(self, epoch: int, start_total_usd: float) -> float:
-        epoch_cost = max(0.0, self.total_usd - float(start_total_usd))
-        self.epoch_costs.append({"epoch": epoch, "epoch_cost_usd": epoch_cost})
-        return epoch_cost
-
-    def projected_total(self, remaining_epochs: int, fallback_epoch_cost_usd: float) -> float:
-        remaining = max(0, int(remaining_epochs))
-        if self.epoch_costs:
-            per_epoch = statistics.mean(e["epoch_cost_usd"] for e in self.epoch_costs)
-        else:
-            per_epoch = float(fallback_epoch_cost_usd)
-        return self.total_usd + (remaining * per_epoch)
-
-    def to_dict(self) -> dict[str, Any]:
-        return {
-            "gpu_hour_rate": self.gpu_hour_rate,
-            "total_gpu_hours": self.total_gpu_hours,
-            "total_api_usd": self.total_api_usd,
-            "total_usd": self.total_usd,
-            "events": self.events,
-            "epoch_costs": self.epoch_costs,
-        }
-
-    @classmethod
-    def from_dict(cls, data: dict[str, Any]) -> "CostTracker":
-        return cls(
-            gpu_hour_rate=float(data.get("gpu_hour_rate", 1.20)),
-            total_gpu_hours=float(data.get("total_gpu_hours", 0.0)),
-            total_api_usd=float(data.get("total_api_usd", 0.0)),
-            total_usd=float(data.get("total_usd", 0.0)),
-            events=list(data.get("events", [])),
-            epoch_costs=list(data.get("epoch_costs", [])),
-        )
 
 
 @dataclass(frozen=True)
@@ -516,12 +440,6 @@ def _write_json(path: Path, payload: dict[str, Any]) -> None:
 def _append_jsonl(path: Path, payload: dict[str, Any]) -> None:
     with path.open("a") as handle:
         handle.write(json.dumps(payload) + "\n")
-
-
-def _load_cost_tracker(path: Path, gpu_hour_rate: float) -> CostTracker:
-    if not path.exists():
-        return CostTracker(gpu_hour_rate=gpu_hour_rate)
-    return CostTracker.from_dict(json.loads(path.read_text()))
 
 
 def _resolve_log_dir(log_path: str) -> Path:
@@ -894,12 +812,6 @@ def _select_bootstrap_seed_task(
         anchor.level,
         source,
     )
-
-
-def _budget_cap(args: argparse.Namespace) -> float:
-    if args.budget_cap_usd is not None:
-        return float(args.budget_cap_usd)
-    return BUDGET_TIER_CAPS[args.budget_tier]
 
 
 def _passes_bootstrap_mutation_guard(
@@ -1299,7 +1211,6 @@ def main(argv: list[str] | None = None) -> int:
     run_dir.mkdir(parents=True, exist_ok=True)
     run_config_path = run_dir / "run_config.json"
     checkpoint_state_path = run_dir / "checkpoint_state.json"
-    cost_tracker_path = run_dir / "cost_tracker.json"
     epoch_summary_path = run_dir / "epoch_summary.jsonl"
     capability_profiles_path = run_dir / "capability_profiles.jsonl"
     replay_path = run_dir / "replay_entries.jsonl"
@@ -1327,7 +1238,6 @@ def main(argv: list[str] | None = None) -> int:
         target_min_completion=args.learnability_low,
         target_max_completion=args.learnability_high,
     )
-    cost_tracker = _load_cost_tracker(cost_tracker_path, args.gpu_hour_rate)
 
     if args.seed_use_mixed_pool:
         if args.seed_pool_mode == "uniform_levels":
@@ -1478,7 +1388,6 @@ def main(argv: list[str] | None = None) -> int:
         if state.get("current_sampler_path"):
             solver.sampler_path = str(state["current_sampler_path"])
 
-    budget_cap = _budget_cap(args)
     start_epoch = next_epoch
     prev_frontier_size: float | None = None
     prev_too_hard_size: float | None = None
@@ -1493,26 +1402,6 @@ def main(argv: list[str] | None = None) -> int:
         probe_pool = list(eval_tasks)
         random.Random(args.seed + (epoch * 4049)).shuffle(probe_pool)
         probe_cursor = 0
-        remaining_epochs = args.epochs - epoch
-        projected_total = cost_tracker.projected_total(
-            remaining_epochs=remaining_epochs,
-            fallback_epoch_cost_usd=args.default_epoch_cost_usd,
-        )
-        if projected_total > budget_cap:
-            _append_jsonl(
-                epoch_summary_path,
-                {
-                    "epoch": epoch,
-                    "status": "halted_budget_projection",
-                    "budget_cap_usd": budget_cap,
-                    "projected_total_usd": projected_total,
-                    "current_total_usd": cost_tracker.total_usd,
-                },
-            )
-            break
-
-        epoch_start_total = cost_tracker.total_usd
-        epoch_start_gpu_hours = cost_tracker.total_gpu_hours
         epoch_records = 0
         successful_records = 0
         profile_rows, profile_wall = _profile_solver(
@@ -1522,12 +1411,6 @@ def main(argv: list[str] | None = None) -> int:
             temperature=args.temperature,
             max_tokens=args.max_tokens,
             eval_workers=args.eval_workers,
-        )
-        cost_tracker.add_cost(
-            "profile",
-            gpu_hours=profile_wall / 3600.0,
-            api_usd=0.0 if args.dry_run else args.profile_api_usd_per_epoch,
-            epoch=epoch,
         )
         profiles = teacher.update_profile(profile_rows, epoch=epoch, split=args.eval_subset)
         for profile in profiles:
@@ -1543,12 +1426,6 @@ def main(argv: list[str] | None = None) -> int:
             target_max_completion=args.learnability_high,
             failure_exemplars=teacher_failure_context,
         )
-        if teacher_backend_name == "tinker":
-            cost_tracker.add_cost(
-                "teacher",
-                api_usd=0.0 if args.dry_run else args.teacher_api_usd_per_epoch,
-                epoch=epoch,
-            )
 
         ranked_train_tasks = teacher.rank_tasks(train_tasks, strategy=args.teacher_strategy)
         profiles_by_zone = teacher.profiles_by_zone()
@@ -1756,17 +1633,6 @@ def main(argv: list[str] | None = None) -> int:
                     "strided reshape/batching patterns."
                 )
             teacher_seed_rationale = seed_plan.rationale
-            if teacher_backend_name == "tinker":
-                cost_tracker.add_cost(
-                    "teacher_seed_directive",
-                    api_usd=0.0 if args.dry_run else args.teacher_api_usd_per_seed_directive,
-                    epoch=epoch,
-                )
-            cost_tracker.add_cost(
-                "mutate",
-                api_usd=0.0 if args.dry_run else args.mutate_api_usd_per_task,
-                epoch=epoch,
-            )
             mutator_target_category = seed_category
             use_frontier_mutator = decision_mode == "too_hard_decompose" or bootstrap_mode
             if use_frontier_mutator:
@@ -1983,12 +1849,6 @@ def main(argv: list[str] | None = None) -> int:
                 admission_attempted_tasks += 1
                 admission_success_rate_sum += float(admission_result["success_rate"])
                 admission_gpu_hours += float(admission_result["wall_clock_s"]) / 3600.0
-                cost_tracker.add_cost(
-                    "admission_gate",
-                    gpu_hours=float(admission_result["wall_clock_s"]) / 3600.0,
-                    api_usd=0.0 if args.dry_run else args.admission_api_usd_per_task,
-                    epoch=epoch,
-                )
                 if not bool(admission_result["admitted"]):
                     allow_bootstrap_passthrough = (
                         bootstrap_mode
@@ -2087,12 +1947,6 @@ def main(argv: list[str] | None = None) -> int:
             solve_utilities.append(
                 preferred_profile.utility_score if preferred_profile is not None else 0.0
             )
-            cost_tracker.add_cost(
-                "solve",
-                gpu_hours=solve_outcome.wall_clock_s / 3600.0,
-                api_usd=0.0 if args.dry_run else args.solve_api_usd_per_task,
-                epoch=epoch,
-            )
             outcome_entry_ids: list[str] = []
             for idx, (kernel_code, eval_result, reward) in enumerate(
                 zip(solve_outcome.kernel_codes, solve_outcome.eval_results, solve_outcome.rewards)
@@ -2161,12 +2015,6 @@ def main(argv: list[str] | None = None) -> int:
                         eval_workers=args.eval_workers,
                     )
                     profile_rows.extend(mini_rows)
-                    cost_tracker.add_cost(
-                        "mini_profile",
-                        gpu_hours=mini_wall / 3600.0,
-                        api_usd=0.0 if args.dry_run else args.mini_profile_api_usd_per_probe,
-                        epoch=epoch,
-                    )
                     profiles = teacher.update_profile(
                         profile_rows,
                         epoch=epoch,
@@ -2185,12 +2033,6 @@ def main(argv: list[str] | None = None) -> int:
                         target_max_completion=args.learnability_high,
                         failure_exemplars=teacher_failure_context,
                     )
-                    if teacher_backend_name == "tinker":
-                        cost_tracker.add_cost(
-                            "teacher",
-                            api_usd=0.0 if args.dry_run else args.teacher_api_usd_per_epoch,
-                            epoch=epoch,
-                        )
                     ranked_train_tasks = teacher.rank_tasks(
                         train_tasks,
                         strategy=args.teacher_strategy,
@@ -2286,13 +2128,6 @@ def main(argv: list[str] | None = None) -> int:
                 ),
                 "replay_epochs_represented": replay_epoch_set,
             }
-            if train_result.training_executed:
-                cost_tracker.add_cost(
-                    "train",
-                    api_usd=0.0 if args.dry_run else args.train_api_usd_per_epoch,
-                    epoch=epoch,
-                )
-
         forgetting = _compute_forgetting_indicator(profiles_by_zone, prior_mastered_categories)
         training_activity["forgetting_indicator"] = forgetting
         learning_zone_profiles = profiles_by_zone.get(ZONE_LEARNING, [])
@@ -2315,8 +2150,6 @@ def main(argv: list[str] | None = None) -> int:
         signal_stats["required_effective_tasks"] = float(required_effective_tasks)
         signal_stats["low_signal_streak"] = float(low_signal_streak)
 
-        epoch_cost = cost_tracker.finalize_epoch(epoch, epoch_start_total)
-        epoch_gpu_hours = max(0.0, cost_tracker.total_gpu_hours - epoch_start_gpu_hours)
         aggregate_fast_1 = (
             statistics.mean([float(row.get("fast_1", 0.0)) for row in profile_rows]) if profile_rows else 0.0
         )
@@ -2335,10 +2168,6 @@ def main(argv: list[str] | None = None) -> int:
             "frontier_size_delta": frontier_delta,
             "too_hard_size": too_hard_size,
             "too_hard_reduction": too_hard_reduction,
-            "fast_1_per_gpu_hour": (aggregate_fast_1 / epoch_gpu_hours) if epoch_gpu_hours > 0 else 0.0,
-            "fast_1_per_usd": (aggregate_fast_1 / epoch_cost) if epoch_cost > 0 else 0.0,
-            "epoch_gpu_hours": epoch_gpu_hours,
-            "epoch_cost_usd": epoch_cost,
             "effective_tasks": effective_tasks,
             "zero_signal_tasks": zero_signal_tasks,
             "required_effective_tasks": required_effective_tasks,
@@ -2387,11 +2216,9 @@ def main(argv: list[str] | None = None) -> int:
         prev_frontier_size = frontier_size
         prev_too_hard_size = too_hard_size
 
-        _write_json(cost_tracker_path, cost_tracker.to_dict())
         checkpoint_payload = {
             "next_epoch": epoch + 1,
             "current_sampler_path": solver.sampler_path,
-            "total_usd": cost_tracker.total_usd,
             "timestamp": time.time(),
         }
         _write_json(checkpoint_state_path, checkpoint_payload)
@@ -2411,8 +2238,6 @@ def main(argv: list[str] | None = None) -> int:
                 "records_added": epoch_records,
                 "records_successful": successful_records,
                 "success_rate": (successful_records / epoch_records) if epoch_records else 0.0,
-                "epoch_cost_usd": epoch_cost,
-                "running_total_usd": cost_tracker.total_usd,
                 "sampler_path": solver.sampler_path,
                 "teacher_decision": asdict(teacher_decision),
                 "phase1_claim_scope": PHASE1_CLAIM_SCOPE,
